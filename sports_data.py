@@ -46,6 +46,9 @@ Add page=False to print it all at once, or save=True to save it to a file.
     nba_leaders(), nhl_leaders() points/rebounds/assists; saves and shots on goal
     nfl_leaders("rec yds", top=25, games=5, position="WR")
 
+    nba_line_scan("rebounds")    rank today's players by their 80% line, highest first
+    nfl_line_scan(), nhl_line_scan()
+
     nfl_scan()                   consistent props (80%+ hit rate) for this week's NFL games
     nba_scan(), nhl_scan()       ...for today's NBA / NHL games
     nfl_scan(games=5)            over each player's last 5 games; games="season" for the whole season
@@ -60,6 +63,7 @@ import datetime
 import functools
 import io
 import json
+import math
 import os
 import re
 import textwrap
@@ -369,10 +373,26 @@ def _average(sport, games, column):
     return f"{sum(values) / len(values):.1f}"
 
 
-def _grid(sport, title, games, columns, team=False, history=None):
+def _hit_value(values, hit):
+    """The highest number reached in at least `hit` of these games, or None if there are none."""
+    values = sorted((v for v in values if v is not None), reverse=True)
+    if not values:
+        return None
+    return values[max(1, math.ceil(hit * len(values) - 1e-9)) - 1]
+
+
+def _hit_line(values, hit):
+    """The highest number reached in at least `hit` of these games ('-' if that's 0 or less):
+    the line a bet would have needed to hit that often."""
+    line = _hit_value(values, hit)
+    return "-" if line is None or line <= 0 else _cell(line) + "+"
+
+
+def _grid(sport, title, games, columns, team=False, history=None, line=None):
     """One row per stat, one column per game, then the averages over the last 5 games, the last
     10 games and the season (taken from `history`, every game this season). Split into blocks
-    that fit the screen."""
+    that fit the screen. line=(hit rate, games to use, header label): one more column with the
+    highest number reached in at least that share of those games."""
     history = history or games
     if sport == "nfl":
         heads = [f"W{g['week']}" for g in games]
@@ -382,11 +402,19 @@ def _grid(sport, title, games, columns, team=False, history=None):
     lines = [("", heads + ["Avg", "Avg", "Avg"]),
              ("Opponent", [("" if g["home"] == "1" else "@") + g["opponent"] for g in games]
               + ["L5", "L10", "Season"])]
+    if line:
+        hit, pool, label = line
+        lines[0][1].append(f"{hit:.0%}")
+        lines[1][1].append(label)
     for c in columns:
         cells = [_cell(_value(sport, g, c)) for g in games]
-        lines.append((_label(sport, c, team), cells + [_average(sport, w, c) for w in windows]))
+        cells += [_average(sport, w, c) for w in windows]
+        if line:
+            cells.append(_hit_line([_number(_value(sport, g, c)) for g in pool], hit))
+        lines.append((_label(sport, c, team), cells))
     label_w = max(len(label) for label, _ in lines)
-    count = len(games) + 3
+    extra = 4 if line else 3
+    count = len(games) + extra
     col_w = [max(len(cells[j]) for _, cells in lines) for j in range(count)]
     width = _width()
     blocks, current, used = [], [], label_w
@@ -396,9 +424,10 @@ def _grid(sport, title, games, columns, team=False, history=None):
             current, used = [], label_w
         current.append(j)
         used += 1 + w
-    # The three averages stay together: beside the last games if they fit, else in their own block
-    averages = [len(games), len(games) + 1, len(games) + 2]
-    if current and used + 3 + sum(col_w[-3:]) <= width:
+    # The averages (and hit line) stay together: beside the last games if they fit, else in
+    # their own block
+    averages = [len(games) + i for i in range(extra)]
+    if current and used + extra + sum(col_w[-extra:]) <= width:
         current += averages
         blocks.append(current)
     else:
@@ -468,7 +497,8 @@ def _find_player(sport, name):
     return sorted(next(iter(found.values())), key=lambda r: (r["game_date"], r["game_id"]))
 
 
-def _show_player(sport, name, last, view, stats):
+def _show_player(sport, name, last, view, stats, hit=0.80, window=10):
+    size, span = _window(window)
     games = _find_player(sport, name)
     if not games:
         return
@@ -482,23 +512,33 @@ def _show_player(sport, name, last, view, stats):
     status = _injury_line(sport, latest["player_name"], latest["team"])
     if status:
         title += "\n" + status
-    _grid(sport, title, games[-last:], columns, history=games)
+    pool = games
+    if sport == "nhl" and latest["position"] == "G":
+        pool = [g for g in games if g.get("starter") == "1"]      # goalies: starts only
+    pool = pool if size is None else pool[-size:]
+    label = "Season" if size is None else f"L{size}"
+    _grid(sport, title, games[-last:], columns, history=games, line=(hit, pool, label))
 
 
-def nfl(name, last=5, stats=None):
+def nfl(name, last=5, stats=None, hit=0.80, window=10):
     """A player's most recent games. QBs, RBs, WR/TEs, kickers and defenders each get their
-    own stats; stats=[...] shows exactly the ones you name."""
-    _show_player("nfl", name, last, lambda pos: NFL_VIEWS.get(pos, NFL_VIEWS["defense"]), stats)
+    own stats; stats=[...] shows exactly the ones you name. The last column is the highest
+    number he reached in at least `hit` (80%) of his last `window` (10) games: the line a bet
+    would have needed to hit that often. window=5 or "season" also work."""
+    _show_player("nfl", name, last, lambda pos: NFL_VIEWS.get(pos, NFL_VIEWS["defense"]), stats,
+                 hit, window)
 
 
-def nhl(name, last=5, stats=None):
-    """A player's most recent games. Goalies get shots faced, saves and goals against."""
-    _show_player("nhl", name, last, lambda pos: NHL_VIEWS["G" if pos == "G" else "skater"], stats)
+def nhl(name, last=5, stats=None, hit=0.80, window=10):
+    """A player's most recent games. Goalies get shots faced, saves and goals against (their
+    hit-line column uses only games they started). Options as in nfl()."""
+    _show_player("nhl", name, last, lambda pos: NHL_VIEWS["G" if pos == "G" else "skater"], stats,
+                 hit, window)
 
 
-def nba(name, last=5, stats=None):
-    """A player's most recent games."""
-    _show_player("nba", name, last, lambda pos: NBA_VIEW, stats)
+def nba(name, last=5, stats=None, hit=0.80, window=10):
+    """A player's most recent games. Options as in nfl()."""
+    _show_player("nba", name, last, lambda pos: NBA_VIEW, stats, hit, window)
 
 
 # ---------------------------------------------------------------------------
@@ -1465,8 +1505,10 @@ LEADER_STATS = {
 _GOALIE_STATS = {"saves", "shots_against", "goals_against"}
 
 
-def _leaders(sport, stat, top, games, min_games, team, position):
+def _leaders(sport, stat, top, games, min_games, team, position, hit=0.80, window=10,
+             totals=False):
     size, span = _window(games)
+    line_size, line_span = _window(window)
     rows = _rows(sport, "player_games")
     if stat is None:
         stats = LEADER_STATS[sport]
@@ -1495,7 +1537,8 @@ def _leaders(sport, stat, top, games, min_games, team, position):
         filters.append(", ".join(sorted(teams)))
     if positions:
         filters.append("/".join(sorted(positions)))
-    out = [f"{sport.upper()} leaders | {span}", rule + (f" | {' | '.join(filters)}" if filters else "")]
+    out = [f"{sport.upper()} leaders | {span}", rule + (f" | {' | '.join(filters)}" if filters else ""),
+           f"{hit:.0%} col: line hit {hit:.0%}+ of {line_span}"]
     for st in stats:
         board = []
         for played in players.values():
@@ -1517,17 +1560,24 @@ def _leaders(sport, stat, top, games, min_games, team, position):
             total = sum(values)
             if total == 0:
                 continue
+            pool = played
+            if sport == "nhl" and latest["position"] == "G":
+                pool = [g for g in played if g.get("starter") == "1"]   # goalies: starts only
+            pool = pool if line_size is None else pool[-line_size:]
             board.append({"name": latest["player_name"], "position": latest["position"] or "-",
                           "team": latest["team"], "gp": len(window), "avg": total / len(window),
-                          "total": total})
+                          "total": total,
+                          "line": _hit_line([_number(_value(sport, g, st)) or 0.0 for g in pool], hit)})
         board.sort(key=lambda b: (-b["avg"], -b["total"], b["name"]))
         title = f"{_label(sport, st)} per game"
         if not board:
             out += _section(title, ["  nobody qualifies"])
             continue
-        table = _table(["#", "Player", "Pos", "Team", "GP", "Per G", "Total"],
-                       [[i, _short_name(b["name"])[:15], b["position"], b["team"], b["gp"],
-                         f"{b['avg']:.2f}" if b["avg"] < 2 else f"{b['avg']:.1f}", _cell(b["total"])]
+        header = ["#", "Player", "Pos", "Team", "GP", "Per G"] + (["Total"] if totals else []) + [f"{hit:.0%}"]
+        table = _table(header,
+                       [[i, _short_name(b["name"])[:14], b["position"], b["team"], b["gp"],
+                         f"{b['avg']:.2f}" if b["avg"] < 2 else f"{b['avg']:.1f}"]
+                        + ([_cell(b["total"])] if totals else []) + [b["line"]]
                         for i, b in enumerate(board[:top], 1)],
                        left=(1, 2, 3))
         out += _section(title, table)
@@ -1535,7 +1585,8 @@ def _leaders(sport, stat, top, games, min_games, team, position):
 
 
 @_paged
-def nfl_leaders(stat=None, top=10, games="season", min_games=None, team=None, position=None):
+def nfl_leaders(stat=None, top=10, games="season", min_games=None, team=None, position=None,
+                hit=0.80, window=10, totals=False):
     """
     NFL per-game leaders: pass yards, pass TDs, rush yards, rush TDs, receptions, rec yards.
     nfl_leaders()                  every board, top 10, this season
@@ -1543,21 +1594,140 @@ def nfl_leaders(stat=None, top=10, games="season", min_games=None, team=None, po
     nfl_leaders(top=25, games=5)   top 25 over each player's last 5 games
     nfl_leaders(position="WR,TE"), nfl_leaders(team="BUF")
     min_games: games needed to qualify (default: half his team's games)
+    The last column is the 80% line: the highest number he reached in at least `hit` (80%) of
+    his last `window` (10) games. hit=0.9, window=5 or window="season" change it.
+    totals=True adds a Total column (wider than a phone screen).
     """
-    _leaders("nfl", stat, top, games, min_games, team, position)
+    _leaders("nfl", stat, top, games, min_games, team, position, hit, window, totals)
 
 
 @_paged
-def nba_leaders(stat=None, top=10, games="season", min_games=None, team=None, position=None):
+def nba_leaders(stat=None, top=10, games="season", min_games=None, team=None, position=None,
+                hit=0.80, window=10, totals=False):
     """NBA per-game leaders: points, rebounds, assists. Options as in nfl_leaders()."""
-    _leaders("nba", stat, top, games, min_games, team, position)
+    _leaders("nba", stat, top, games, min_games, team, position, hit, window, totals)
 
 
 @_paged
-def nhl_leaders(stat=None, top=10, games="season", min_games=None, team=None, position=None):
+def nhl_leaders(stat=None, top=10, games="season", min_games=None, team=None, position=None,
+                hit=0.80, window=10, totals=False):
     """NHL per-game leaders: saves (goalies) and shots on goal (skaters). Options as in
-    nfl_leaders(); position="D" for defensemen, "C,L,R" for forwards."""
-    _leaders("nhl", stat, top, games, min_games, team, position)
+    nfl_leaders(); position="D" for defensemen, "C,L,R" for forwards. Goalies' 80% line uses
+    only games they started."""
+    _leaders("nhl", stat, top, games, min_games, team, position, hit, window, totals)
+
+
+# ---------------------------------------------------------------------------
+# Line scan: today's players ranked by their 80% line
+# ---------------------------------------------------------------------------
+
+def _line_scan(sport, stat, window, hit, top, team, day, all_teams, min_games, order):
+    size, span = _window(window)
+    if order not in ("highest", "lowest"):
+        raise ValueError('order must be "highest" or "lowest"')
+    stats = (LEADER_STATS[sport] if stat is None
+             else _resolve_stats(sport, "player_games", [stat] if isinstance(stat, str) else list(stat)))
+
+    # Which teams: one team, today's (this week's) games, or everyone
+    slate, when = None, "all teams"
+    if team:
+        slate = {t.strip().upper() for t in ([team] if isinstance(team, str) else team)}
+        when = ", ".join(sorted(slate))
+    elif not all_teams:
+        try:
+            games_slate, when = _slate(sport, day or _today())
+            slate = set(games_slate)
+        except Exception as e:
+            print(f"(Couldn't load the schedule: {e}. Scanning every team.)")
+        if slate is not None and not slate:
+            print(f"No {sport.upper()} games found for {when}. Use all_teams=True to scan everyone.")
+            return
+
+    rows = _rows(sport, "player_games")
+    team_dates = {}
+    for r in rows:
+        team_dates.setdefault(r["team"], set()).add(r["game_date"])
+    recent = {t: sorted(d)[-2] if len(d) > 1 else sorted(d)[-1] for t, d in team_dates.items()}
+    players = {}
+    for r in rows:
+        players.setdefault(r["player_id"], []).append(r)
+
+    out = [f"{sport.upper()} line scan | {when}", f"{span} | {hit:.0%} line, {order} first"]
+    for st in stats:
+        board = []
+        for played in players.values():
+            played.sort(key=lambda r: (r["game_date"], r["game_id"]))
+            latest = played[-1]
+            if slate is not None and latest["team"] not in slate:
+                continue
+            if latest["game_date"] < recent.get(latest["team"], ""):
+                continue                                   # missed his team's last two games
+            if sport == "nhl" and (latest["position"] == "G") != (st in _GOALIE_STATS):
+                continue
+            pool = played
+            if sport == "nhl" and latest["position"] == "G":
+                pool = [g for g in played if g.get("starter") == "1"]
+            window_games = pool if size is None else pool[-size:]
+            if len(window_games) < min_games:
+                continue
+            values = [_number(_value(sport, g, st)) or 0.0 for g in window_games]
+            average = sum(values) / len(values)
+            if average < _floor(sport, latest["position"], st):
+                continue                                   # too small a role to matter
+            line = _hit_value(values, hit)
+            if line is None or line <= 0:
+                continue
+            board.append({"name": latest["player_name"], "position": latest["position"] or "-",
+                          "team": latest["team"], "avg": average, "line": line})
+        sign = -1 if order == "highest" else 1
+        board.sort(key=lambda b: (sign * b["line"], sign * b["avg"], b["name"]))
+        title = _label(sport, st)
+        if not board:
+            out += _section(title, ["  nobody qualifies"])
+            continue
+        table = _table(["#", "Player", "Pos", "Team", "Avg", f"{hit:.0%}"],
+                       [[i, _short_name(b["name"])[:14], b["position"], b["team"],
+                         f"{b['avg']:.2f}" if b["avg"] < 2 else f"{b['avg']:.1f}",
+                         _cell(b["line"]) + "+"]
+                        for i, b in enumerate(board[:top], 1)],
+                       left=(1, 2, 3))
+        out += _section(title, table)
+    out += ["", f"{hit:.0%} = the highest number he reached",
+            f"in at least {hit:.0%} of the games: the line",
+            "a bet would have needed to hit that",
+            "often (10+ = an over 9.5 bet)."]
+    print("\n".join(out))
+
+
+@_paged
+def nfl_line_scan(stat=None, window=10, hit=0.80, top=25, team=None, all_teams=False,
+                  min_games=5, order="highest"):
+    """
+    Rank this week's NFL players by their 80% line for a prop (the highest number they reached
+    in at least 80% of their last `window` games), highest first.
+    nfl_line_scan("rec yds")            one stat (default: pass/rush/rec yards and TDs, receptions)
+    nfl_line_scan("rec yds", order="lowest")
+    nfl_line_scan("rec yds", window=5), window="season", hit=0.9, top=50, team="BUF",
+    all_teams=True (everyone, playing this week or not)
+    Players averaging below the stat's minimum line (SCAN_FLOOR) are left out.
+    """
+    _line_scan("nfl", stat, window, hit, top, team, None, all_teams, min_games, order)
+
+
+@_paged
+def nba_line_scan(stat=None, window=10, hit=0.80, top=25, team=None, day=None, all_teams=False,
+                  min_games=5, order="highest"):
+    """The line scan for today's NBA games (points, rebounds, assists). Options as in
+    nfl_line_scan(); day=datetime.date(...) for another day."""
+    _line_scan("nba", stat, window, hit, top, team, day, all_teams, min_games, order)
+
+
+@_paged
+def nhl_line_scan(stat=None, window=10, hit=0.80, top=25, team=None, day=None, all_teams=False,
+                  min_games=5, order="highest"):
+    """The line scan for today's NHL games (saves for goalies, using starts only; shots on goal
+    for skaters). Options as in nfl_line_scan()."""
+    _line_scan("nhl", stat, window, hit, top, team, day, all_teams, min_games, order)
 
 
 # ---------------------------------------------------------------------------
@@ -1917,8 +2087,16 @@ PLAYERS: nfl(), nba(), nhl()
 
 A player's recent games, one row per
 stat, with averages for his last 5,
-last 10 and all games this season, and
-his injury status if he's listed.
+last 10 and all games this season, the
+80% line, and his injury status if
+he's listed.
+
+The 80% line ("80% L10") is the
+highest number he reached in at least
+8 of his last 10 games: the line a bet
+would have needed to hit 80% of the
+time. "10+" = an over 9.5 bet. "-"
+means it would be 0.
 
 Usage:
   nfl("josh allen")
@@ -1931,6 +2109,9 @@ Usage:
   nfl("josh allen",
       stats=["Pass Yards",
              "passing_epa"])
+  nba("gobert", hit=0.9)
+  nba("gobert", window=5)
+  nba("gobert", window="season")
 
 Options:
   last=5      games shown (averages
@@ -1940,6 +2121,12 @@ Options:
               readable name or column
               name (see
               guide("columns"))
+  hit=0.80    hit rate for the line
+              column (0.9 = 90% line)
+  window=10   games for the line
+              column: 5, 10, any
+              number, or "season"
+              (goalies: starts only)
 
 Names: part of a name works ("ceedee").
 If a name is shared, add a team code
@@ -1979,10 +2166,10 @@ Rush Yards    41   33  57
 Rush TDs       1    0   0
 Fumbles        0    0   0
 
-              Avg  Avg    Avg
-Opponent       L5  L10 Season
-Pass Att     34.0 33.6   33.4
-Pass Yards  279.2 271.9  269.6
+             Avg   Avg    Avg  80%
+Opponent      L5   L10 Season  L10
+Pass Att    34.0  33.6   33.4  31+
+Pass Yards 279.2 271.9  269.6 254+
 ...
 (@ = away game. NFL columns are weeks;
 NBA and NHL columns are dates.)
@@ -2375,25 +2562,90 @@ Options (defaults first):
                 (in the window)
   team=None     a team code or a list
   position=None  "WR", "WR,TE", "D" ...
+  hit=0.80      hit rate for the last
+                column (0.9 = 90% line)
+  window=10     games for that column:
+                5, 10, any number, or
+                "season"
+  totals=False  True adds a Total
+                column (wider than the
+                screen)
   page, save    see guide("paging")
 
-Per game = per game played.
+Per game = per game played. The last
+column is the 80% line: the highest
+number he reached in at least 8 of his
+last 10 games (see guide("players")).
 
 Output (made up):
 NFL leaders | season
 min half his team's games
+80% col: line hit 80%+ of last 10 games
 
 ==================================
 Rec Yards per game
 ==================================
- # Player      Pos Team GP Per G Total
- 1 J.Chase     WR  CIN  11 104.2  1146
- 2 J.Jefferson WR  MIN  11  98.7  1086
+ # Player      Pos Team GP Per G  80%
+ 1 J.Chase     WR  CIN  11 104.2  81+
+ 2 J.Jefferson WR  MIN  11  98.7  77+
+...
+''')
+
+GUIDE["lines"] = ("nfl_line_scan() etc.: rank by 80% line", '''
+LINE SCANS: nfl_line_scan(),
+nba_line_scan(), nhl_line_scan()
+
+Ranks today's players by their 80%
+line for a prop: the highest number
+they reached in at least 8 of their
+last 10 games. Highest first.
+
+Covers today's games (NFL: this week).
+
+Usage:
+  nba_line_scan("rebounds")
+  nba_line_scan()           points,
+                            rebounds and
+                            assists
+  nba_line_scan("reb",
+                order="lowest")
+  nfl_line_scan("rec yds", window=5)
+  nhl_line_scan("shots", team="NYR")
+  nba_line_scan("pts", hit=0.9)
+
+Options (defaults first):
+  stat=None       one stat, or the
+                  leader stats
+  window=10       5, 10, any number,
+                  or "season"
+  hit=0.80        the line's hit rate
+  order="highest" or "lowest"
+  top=25          players per board
+  team=None       a team or a list
+  all_teams=False True = everyone
+  min_games=5     games needed
+  day=None        NBA/NHL: another day
+  page, save      see guide("paging")
+
+Players averaging below the stat's
+minimum line (SCAN_FLOOR) are left
+out. Goalies: starts only.
+
+Output (made up):
+NBA line scan | 11/22
+last 10 games | 80% line, highest first
+
+==================================
+Rebounds
+==================================
+# Player   Pos Team  Avg 80%
+1 R.Gobert C   MIN  11.5 11+
+2 J.Allen  C   CLE  10.8 10+
 ...
 ''')
 
 _GUIDE_ORDER = ["start", "report", "daily", "players", "teams", "standings", "leaders",
-                "scan", "injuries", "columns", "status", "paging", "settings", "codes"]
+                "scan", "lines", "injuries", "columns", "status", "paging", "settings", "codes"]
 _GUIDE_ALIASES = {
     "daily_report": "report", "players": "players", "player": "players", "nfl": "players",
     "nba": "players", "nhl": "players", "team": "teams", "nfl_team": "teams",
@@ -2408,6 +2660,10 @@ _GUIDE_ALIASES = {
     "leader": "leaders", "nfl_leaders": "leaders", "nba_leaders": "leaders",
     "nhl_leaders": "leaders", "player standings": "leaders", "player_standings": "leaders",
     "leaderboard": "leaders", "leaderboards": "leaders",
+    "line": "lines", "line scan": "lines", "line_scan": "lines", "nfl_line_scan": "lines",
+    "nba_line_scan": "lines", "nhl_line_scan": "lines", "gap": "lines", "gaps": "lines",
+    "80%": "lines", "consistency": "lines", "gap scan": "lines", "gap_scan": "lines",
+    "nfl_gap_scan": "lines", "nba_gap_scan": "lines", "nhl_gap_scan": "lines",
     "usage": "start", "guide": "start",
 }
 
