@@ -1,13 +1,17 @@
 # sports-data
 
 A daily GitHub Actions job that builds NFL, NBA and NHL game-by-game stats files in one
-consistent format and publishes them on this repository's **data** release, available
-for download.
+consistent format and publishes them on this repository's **data** release, where the phone
+tools download them.
 
 - **NFL** comes from nflverse's published files, reshaped to the shared format. Records are
   cross-checked against ESPN's standings.
 - **NHL** comes from the official NHL API (api-web.nhle.com).
 - **NBA** comes from ESPN's public JSON (site.api.espn.com).
+
+After updating the data, the job also writes **`daily_props.txt`**: consistent player props for
+that day's games in every sport, in start-time order, with both teams' records and how each
+player's opponent compares with the league. `daily_report()` in `sports_data.py` prints it.
 
 Each sport publishes four files (NHL 2026-27 shown):
 
@@ -44,8 +48,9 @@ choose **Request Desktop Website**.
    and tap **Create repository**. It must be public for the job to be free and for the
    phone to download the files without logging in.
 3. **Upload the Python files.** In the repository, tap **Add file** → **Upload files**, choose
-   `common.py`, `nfl.py`, `nhl.py`, `nba.py`, `update.py` and `README.md` (replacing the
-   default README), then **Commit changes**.
+   `common.py`, `nfl.py`, `nhl.py`, `nba.py`, `update.py`, `sports_data.py` and `README.md`
+   (replacing the default README), then **Commit changes**. The job uses `sports_data.py` to
+   build the daily props report.
 4. **Add the workflow.** Tap **Add file** → **Create new file**. For the name, type exactly
    `.github/workflows/update.yml` (the slashes create the folders). Open `update.yml` in
    the Files app, copy all of it, paste it into the editor, then **Commit changes**.
@@ -53,7 +58,8 @@ choose **Request Desktop Website**.
    **Update stats** → **Run workflow** → **Run workflow**. The first run fetches the whole
    season so far, so give it several minutes.
 6. **Check the result.** A green check means it worked. On the repository's main page,
-   tap **Releases** → **Stats data**: you should see twelve files, four per sport. A red X means a sport
+   tap **Releases** → **Stats data**: you should see twelve data files, four per sport, plus
+   `daily_props.txt`. A red X means a sport
    failed its checks: tap the run, then **Fetch and check the data**, to read why.
 7. **Set up the phone script.** Copy `sports_data.py` into a-Shell, change the `REPO` line
    near the top to `your-github-name/sports-data`, then run:
@@ -61,6 +67,7 @@ choose **Request Desktop Website**.
    ```
    python3 -i sports_data.py
    >>> status()
+   >>> daily_report()
    >>> nfl("josh allen")
    >>> nhl("mcdavid")
    >>> nba_team("NY")
@@ -88,7 +95,31 @@ The job runs at 10:00 UTC (5-6am Eastern). For each sport it:
    the status file says what failed, and the run shows a red X. GitHub emails you about
    failed runs by default.
 
+Then it builds `daily_props.txt` for that day's games (if there are any) and publishes it with
+the data. If building the report fails, the data is still published and yesterday's report stays.
+
 To force a full re-fetch, use **Run workflow** and tick **Re-fetch every game this season**.
+
+## The daily props report
+
+For each sport with games that day, `daily()` finds every player on those teams with a line he
+reached in at least 80% of his last 10 games (the scanner's settings), then lists them under
+their game:
+
+- Games are in start-time order (Eastern). Games that start together are listed one after the
+  other, each with its own props.
+- Each game shows the sport, the start time and both teams' records.
+- Each prop shows the line, his hit rate, average and lowest game, then the matchup:
+  - **NBA:** what the opponent allows per game to his position (guards, forwards, centers)
+  - **NHL skaters:** shots on goal the opponent allows per game
+  - **NHL goalies:** shots on goal the opponent's offense takes per game
+  - **NFL QBs, WRs and TEs:** the opponent's pass defense (pass yards allowed; pass TDs
+    allowed for TD props); **RBs:** the run defense (rush yards allowed)
+  - the opponent's rank and how far above or below league average it is, with a verdict for
+    the over: **favorable** (5%+ above average), **tough** (5%+ below) or **neutral**
+
+Change `daily()` in the workflow (for example `daily(games=5)` or `daily(min_hit=0.9)`) to
+change the morning report; on the phone, `daily()` takes the same options.
 
 ## Things to know
 
