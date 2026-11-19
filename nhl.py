@@ -28,6 +28,7 @@ TEAM_COLUMNS = [
     "result", "decided_in", "goals_for", "goals_against", "shots_for", "shots_against",
     "hits", "blocked_shots", "pim", "pp_goals", "giveaways", "takeaways",
     "opp_hits", "opp_pp_goals",
+    "check_note",       # set when the NHL's own box score doesn't add up (see fetch_game)
 ]
 TEAM_KEY = ("game_id", "team")
 
@@ -120,11 +121,12 @@ def _sum(rows, field):
     return sum(r.get(field) or 0 for r in rows)
 
 
-def _fill_goalie_offense(get, gid, players):
-    """Set every goalie's goals, assists, points and shots from the game's play-by-play
-    (shootout attempts don't count)."""
+def _pbp_counts(get, gid):
+    """Goals, assists and shots on goal per player id from the game's play-by-play, plus goals
+    and shots per team id. Shootout attempts don't count."""
     pbp = get(f"{WEB}/gamecenter/{gid}/play-by-play")
-    counts = {}
+    players, teams = {}, {}
+    blank = {"goals": 0, "assists": 0, "shots": 0}
     for play in pbp.get("plays", []):
         kind = play.get("typeDescKey")
         if kind not in ("goal", "shot-on-goal"):
@@ -133,18 +135,18 @@ def _fill_goalie_offense(get, gid, players):
             continue
         d = play.get("details") or {}
         shooter = d.get("scoringPlayerId") if kind == "goal" else d.get("shootingPlayerId")
-        c = counts.setdefault(str(shooter), {"goals": 0, "assists": 0, "shots": 0})
-        c["shots"] += 1                     # a goal is also a shot on goal
+        team = teams.setdefault(str(d.get("eventOwnerTeamId")), {"goals": 0, "shots": 0})
+        team["shots"] += 1                  # a goal is also a shot on goal
+        if shooter is not None:
+            players.setdefault(str(shooter), dict(blank))["shots"] += 1
         if kind == "goal":
-            c["goals"] += 1
+            team["goals"] += 1
+            if shooter is not None:
+                players[str(shooter)]["goals"] += 1
             for key in ("assist1PlayerId", "assist2PlayerId"):
                 if d.get(key) is not None:
-                    counts.setdefault(str(d[key]), {"goals": 0, "assists": 0, "shots": 0})["assists"] += 1
-    for row in players:
-        if row["position"] == "G":
-            c = counts.get(row["player_id"], {"goals": 0, "assists": 0, "shots": 0})
-            row.update(goals=c["goals"], assists=c["assists"], shots=c["shots"],
-                       points=c["goals"] + c["assists"])
+                    players.setdefault(str(d[key]), dict(blank))["assists"] += 1
+    return players, teams
 
 
 def fetch_game(get, gid, info, ctx, season_id):
@@ -201,17 +203,44 @@ def fetch_game(get, gid, info, ctx, season_id):
             side_rows[side].append(row)
 
     # Goalies occasionally shoot on goal or score (usually into an empty net), but the box
-    # score doesn't show it. If a team's player totals don't match its score or shots,
-    # fill in the goalies' goals, assists and shots from the play-by-play.
-    for side, other in (("homeTeam", "awayTeam"), ("awayTeam", "homeTeam")):
-        goals = to_int(box[side].get("score"))
-        if decided == "SO" and goals is not None and goals > (to_int(box[other].get("score")) or 0):
-            goals -= 1
-        sog = to_int(box[side].get("sog"))
-        if (_sum(side_rows[side], "goals") != goals
-                or (sog is not None and _sum(side_rows[side], "shots") != sog)):
-            _fill_goalie_offense(get, gid, players)
-            break
+    # score doesn't show it. If a team's player totals don't match its score or shots, the
+    # play-by-play fills in the goalies' goals, assists and shots. If it still doesn't add up:
+    #   - a player in the play-by-play who isn't in our rows means our data is incomplete,
+    #     so the game fails;
+    #   - otherwise the NHL's own box score disagrees with itself. Its official numbers are
+    #     kept, and the team row's check_note says what doesn't add up (a warning, not a failure).
+    def mismatches():
+        found = {}
+        for side, other in (("homeTeam", "awayTeam"), ("awayTeam", "homeTeam")):
+            goals = to_int(box[side].get("score"))
+            if decided == "SO" and goals is not None and goals > (to_int(box[other].get("score")) or 0):
+                goals -= 1
+            sog = to_int(box[side].get("sog"))
+            got_goals, got_shots = _sum(side_rows[side], "goals"), _sum(side_rows[side], "shots")
+            if got_goals != goals or (sog is not None and got_shots != sog):
+                found[side] = (got_goals, goals, got_shots, sog)
+        return found
+
+    notes = {}
+    if mismatches():
+        pbp_players, pbp_teams = _pbp_counts(get, gid)
+        for row in players:
+            if row["position"] == "G":
+                c = pbp_players.get(row["player_id"], {"goals": 0, "assists": 0, "shots": 0})
+                row.update(goals=c["goals"], assists=c["assists"], shots=c["shots"],
+                           points=c["goals"] + c["assists"])
+        still = mismatches()
+        if still:
+            ours = {r["player_id"] for r in players}
+            missing = sorted(pid for pid in pbp_players if pid not in ours)
+            if missing:
+                raise RuntimeError(f"play-by-play has player(s) {', '.join(missing)} who aren't "
+                                   "in the box score")
+            for side, (got_goals, goals, got_shots, sog) in still.items():
+                pbp = pbp_teams.get(str(box[side].get("id")), {})
+                notes[side] = (f"NHL box score doesn't add up: players' goals {got_goals} vs "
+                               f"team {goals}, players' shots {got_shots} vs team {sog}; "
+                               f"play-by-play has goals {pbp.get('goals')}, shots {pbp.get('shots')}")
     teams = []
     for side, other, is_home in (("homeTeam", "awayTeam", True), ("awayTeam", "homeTeam", False)):
         t, o = box[side], box[other]
@@ -232,6 +261,7 @@ def fetch_game(get, gid, info, ctx, season_id):
             "pim": _sum(mine, "pim"), "pp_goals": _sum(mine, "pp_goals"),
             "giveaways": _sum(mine, "giveaways"), "takeaways": _sum(mine, "takeaways"),
             "opp_hits": _sum(theirs, "hits"), "opp_pp_goals": _sum(theirs, "pp_goals"),
+            "check_note": notes.get(side, ""),
         })
     return players, teams
 
@@ -273,10 +303,15 @@ def validate(players, teams, final_games, ctx):
         # A shootout win adds one goal to the score that no player is credited with
         if r["decided_in"] == "SO" and r["result"] == "W":
             goals -= 1
+        problems = []
         if s["goals"] != goals:
-            errors.append(f"game {r['game_id']} {r['team']}: players' goals add up to "
-                          f"{s['goals']}, expected {goals}")
+            problems.append(f"players' goals add up to {s['goals']}, expected {goals}")
         if s["shots"] != int(r["shots_for"]):
-            errors.append(f"game {r['game_id']} {r['team']}: players' shots add up to "
-                          f"{s['shots']}, team has {r['shots_for']}")
+            problems.append(f"players' shots add up to {s['shots']}, team has {r['shots_for']}")
+        for problem in problems:
+            message = f"game {r['game_id']} {r['team']}: {problem}"
+            if r.get("check_note"):
+                ctx.setdefault("warnings", []).append(f"{message} ({r['check_note']})")
+            else:
+                errors.append(message)
     return errors
