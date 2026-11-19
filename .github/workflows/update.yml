@@ -33,6 +33,20 @@ jobs:
         env:
           FULL_REBUILD: ${{ inputs.full_rebuild && '1' || '0' }}
 
+      # Today's props for every sport, from the files just built (a sport that failed its checks
+      # uses its previously published files). Written to a temporary file first, so a failure
+      # never replaces yesterday's report with an empty one.
+      - name: Build today's props report
+        if: always()
+        continue-on-error: true
+        env:
+          SPORTS_DATA_LOCAL: out
+          SPORTS_DATA_REPO: ${{ github.repository }}
+        run: |
+          python -c "import sports_data; sports_data.daily()" > daily_props.txt
+          cat daily_props.txt
+          mv daily_props.txt out/daily_props.txt
+
       # Runs even if a sport failed its checks: that sport only has its status file in out/,
       # so its previously published data stays untouched, while a sport that passed is updated.
       - name: Publish to the "data" release
