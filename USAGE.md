@@ -14,6 +14,7 @@ list of topics, or `usage("daily")` for one topic. Example output uses made-up n
 - [nfl_standings() etc.: standings](#nfl_standings-etc-standings)
 - [nfl_leaders() etc.: player leaders](#nfl_leaders-etc-player-leaders)
 - [nfl_scan(), nba_scan(), nhl_scan()](#nfl_scan-nba_scan-nhl_scan)
+- [nfl_line_scan() etc.: rank by 80% line](#nfl_line_scan-etc-rank-by-80-line)
 - [nfl_injuries(), nba_injuries(), nhl_injuries()](#nfl_injuries-nba_injuries-nhl_injuries)
 - [nfl_columns() etc.: find stat names](#nfl_columns-etc-find-stat-names)
 - [status(): is the data up to date?](#status-is-the-data-up-to-date)
@@ -180,8 +181,16 @@ PLAYERS: nfl(), nba(), nhl()
 
 A player's recent games, one row per
 stat, with averages for his last 5,
-last 10 and all games this season, and
-his injury status if he's listed.
+last 10 and all games this season, the
+80% line, and his injury status if
+he's listed.
+
+The 80% line ("80% L10") is the
+highest number he reached in at least
+8 of his last 10 games: the line a bet
+would have needed to hit 80% of the
+time. "10+" = an over 9.5 bet. "-"
+means it would be 0.
 
 Usage:
   nfl("josh allen")
@@ -194,6 +203,9 @@ Usage:
   nfl("josh allen",
       stats=["Pass Yards",
              "passing_epa"])
+  nba("gobert", hit=0.9)
+  nba("gobert", window=5)
+  nba("gobert", window="season")
 
 Options:
   last=5      games shown (averages
@@ -203,6 +215,12 @@ Options:
               readable name or column
               name (see
               guide("columns"))
+  hit=0.80    hit rate for the line
+              column (0.9 = 90% line)
+  window=10   games for the line
+              column: 5, 10, any
+              number, or "season"
+              (goalies: starts only)
 
 Names: part of a name works ("ceedee").
 If a name is shared, add a team code
@@ -242,10 +260,10 @@ Rush Yards    41   33  57
 Rush TDs       1    0   0
 Fumbles        0    0   0
 
-              Avg  Avg    Avg
-Opponent       L5  L10 Season
-Pass Att     34.0 33.6   33.4
-Pass Yards  279.2 271.9  269.6
+             Avg   Avg    Avg  80%
+Opponent      L5   L10 Season  L10
+Pass Att    34.0  33.6   33.4  31+
+Pass Yards 279.2 271.9  269.6 254+
 ...
 (@ = away game. NFL columns are weeks;
 NBA and NHL columns are dates.)
@@ -404,20 +422,32 @@ Options (defaults first):
                 (in the window)
   team=None     a team code or a list
   position=None  "WR", "WR,TE", "D" ...
+  hit=0.80      hit rate for the last
+                column (0.9 = 90% line)
+  window=10     games for that column:
+                5, 10, any number, or
+                "season"
+  totals=False  True adds a Total
+                column (wider than the
+                screen)
   page, save    see guide("paging")
 
-Per game = per game played.
+Per game = per game played. The last
+column is the 80% line: the highest
+number he reached in at least 8 of his
+last 10 games (see guide("players")).
 
 Output (made up):
 NFL leaders | season
 min half his team's games
+80% col: line hit 80%+ of last 10 games
 
 ==================================
 Rec Yards per game
 ==================================
- # Player      Pos Team GP Per G Total
- 1 J.Chase     WR  CIN  11 104.2  1146
- 2 J.Jefferson WR  MIN  11  98.7  1086
+ # Player      Pos Team GP Per G  80%
+ 1 J.Chase     WR  CIN  11 104.2  81+
+ 2 J.Jefferson WR  MIN  11  98.7  77+
 ...
 ```
 
@@ -482,6 +512,63 @@ reached in at least min_hit of the
 games. Stats have minimum lines so
 trivial ones don't show; see
 guide("settings").
+```
+
+## nfl_line_scan() etc.: rank by 80% line
+
+In a-Shell: `usage("lines")`
+
+```text
+LINE SCANS: nfl_line_scan(),
+nba_line_scan(), nhl_line_scan()
+
+Ranks today's players by their 80%
+line for a prop: the highest number
+they reached in at least 8 of their
+last 10 games. Highest first.
+
+Covers today's games (NFL: this week).
+
+Usage:
+  nba_line_scan("rebounds")
+  nba_line_scan()           points,
+                            rebounds and
+                            assists
+  nba_line_scan("reb",
+                order="lowest")
+  nfl_line_scan("rec yds", window=5)
+  nhl_line_scan("shots", team="NYR")
+  nba_line_scan("pts", hit=0.9)
+
+Options (defaults first):
+  stat=None       one stat, or the
+                  leader stats
+  window=10       5, 10, any number,
+                  or "season"
+  hit=0.80        the line's hit rate
+  order="highest" or "lowest"
+  top=25          players per board
+  team=None       a team or a list
+  all_teams=False True = everyone
+  min_games=5     games needed
+  day=None        NBA/NHL: another day
+  page, save      see guide("paging")
+
+Players averaging below the stat's
+minimum line (SCAN_FLOOR) are left
+out. Goalies: starts only.
+
+Output (made up):
+NBA line scan | 11/22
+last 10 games | 80% line, highest first
+
+==================================
+Rebounds
+==================================
+# Player   Pos Team  Avg 80%
+1 R.Gobert C   MIN  11.5 11+
+2 J.Allen  C   CLE  10.8 10+
+...
 ```
 
 ## nfl_injuries(), nba_injuries(), nhl_injuries()
