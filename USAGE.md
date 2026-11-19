@@ -11,6 +11,8 @@ list of topics, or `usage("daily")` for one topic. Example output uses made-up n
 - [daily(): build today's report now](#daily-build-todays-report-now)
 - [nfl(), nba(), nhl(): a player's games](#nfl-nba-nhl-a-players-games)
 - [nfl_team(), nba_team(), nhl_team(): a team](#nfl_team-nba_team-nhl_team-a-team)
+- [nfl_standings() etc.: standings](#nfl_standings-etc-standings)
+- [nfl_leaders() etc.: player leaders](#nfl_leaders-etc-player-leaders)
 - [nfl_scan(), nba_scan(), nhl_scan()](#nfl_scan-nba_scan-nhl_scan)
 - [nfl_injuries(), nba_injuries(), nhl_injuries()](#nfl_injuries-nba_injuries-nhl_injuries)
 - [nfl_columns() etc.: find stat names](#nfl_columns-etc-find-stat-names)
@@ -47,6 +49,8 @@ Most used:
   daily()               a fresh report
   nfl("josh allen")     a player
   nfl_team("BUF")       a team
+  nba_standings()       standings
+  nfl_leaders()         player leaders
   nba_scan()            today's props
   nba_injuries("NY")    a team's
                         injury report
@@ -298,6 +302,122 @@ Opponent            LV @LAC MIA
 Result               W    W   L
 Points Scored       31   27  20
 Points Allowed      17   24  23
+...
+```
+
+## nfl_standings() etc.: standings
+
+In a-Shell: `usage("standings")`
+
+```text
+STANDINGS: nfl_standings(),
+nba_standings(), nhl_standings()
+
+Official standings, checked live: the
+whole league, then each conference.
+One section per page.
+
+Usage:
+  nba_standings()           league and
+                            conferences
+  nba_standings("east")     one
+                            conference
+  nba_standings("overall")  league only
+  nfl_standings("afc")
+  nfl_standings("nfc")
+  nhl_standings("west")
+
+Options:
+  view=None     "overall", or a
+                conference: "east" /
+                "west" (NBA, NHL),
+                "afc" / "nfc" (NFL)
+  page, save    see guide("paging")
+
+Columns:
+  NFL: W-L-T, Pct, PF (points for), PA
+    (points against), Strk (streak)
+  NBA: W-L, Pct, GB (games behind the
+    leader), Strk
+  NHL: GP, W-L-OT, Pts, P% (points %),
+    GD (goal difference), Strk
+
+The league table is sorted by win %
+(NHL: points). Conferences are in
+playoff-seed order (NHL: conference
+standing).
+
+Output (made up):
+NBA standings | checked 3:05 PM ET
+
+==================================
+Eastern Conference
+==================================
+ # Team  W-L  Pct  GB Strk
+ 1 BOS  16-2 .889   -   W2
+ 2 NY   15-3 .833 1.0   W5
+...
+
+If the live standings can't load, it
+shows overall records from your data
+files instead (no conferences).
+```
+
+## nfl_leaders() etc.: player leaders
+
+In a-Shell: `usage("leaders")`
+
+```text
+PLAYER LEADERS: nfl_leaders(),
+nba_leaders(), nhl_leaders()
+
+Per-game leaderboards, one per page.
+
+Boards:
+  NFL: pass yards, pass TDs, rush
+    yards, rush TDs, receptions, rec
+    yards
+  NBA: points, rebounds, assists
+  NHL: saves (goalies), shots on goal
+    (skaters)
+
+Usage:
+  nfl_leaders()
+  nfl_leaders("rec yds")
+  nfl_leaders(top=25)
+  nfl_leaders(games=5)
+  nfl_leaders(position="WR,TE")
+  nfl_leaders(team="BUF")
+  nba_leaders("assists", top=20)
+  nhl_leaders(position="D")
+
+Options (defaults first):
+  stat=None     one board (readable or
+                column name; see
+                guide("columns")), or a
+                list
+  top=10        players per board
+  games="season"  or 5, 10, any number:
+                each player's last N
+  min_games=None  games needed; default
+                half his team's games
+                (in the window)
+  team=None     a team code or a list
+  position=None  "WR", "WR,TE", "D" ...
+  page, save    see guide("paging")
+
+Per game = per game played.
+
+Output (made up):
+NFL leaders | season
+min half his team's games
+
+==================================
+Rec Yards per game
+==================================
+ # Player      Pos Team GP Per G Total
+ 1 J.Chase     WR  CIN  11 104.2  1146
+ 2 J.Jefferson WR  MIN  11  98.7  1086
 ...
 ```
 
