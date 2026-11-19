@@ -120,6 +120,33 @@ def _sum(rows, field):
     return sum(r.get(field) or 0 for r in rows)
 
 
+def _fill_goalie_offense(get, gid, players):
+    """Set every goalie's goals, assists, points and shots from the game's play-by-play
+    (shootout attempts don't count)."""
+    pbp = get(f"{WEB}/gamecenter/{gid}/play-by-play")
+    counts = {}
+    for play in pbp.get("plays", []):
+        kind = play.get("typeDescKey")
+        if kind not in ("goal", "shot-on-goal"):
+            continue
+        if (play.get("periodDescriptor") or {}).get("periodType") == "SO":
+            continue
+        d = play.get("details") or {}
+        shooter = d.get("scoringPlayerId") if kind == "goal" else d.get("shootingPlayerId")
+        c = counts.setdefault(str(shooter), {"goals": 0, "assists": 0, "shots": 0})
+        c["shots"] += 1                     # a goal is also a shot on goal
+        if kind == "goal":
+            c["goals"] += 1
+            for key in ("assist1PlayerId", "assist2PlayerId"):
+                if d.get(key) is not None:
+                    counts.setdefault(str(d[key]), {"goals": 0, "assists": 0, "shots": 0})["assists"] += 1
+    for row in players:
+        if row["position"] == "G":
+            c = counts.get(row["player_id"], {"goals": 0, "assists": 0, "shots": 0})
+            row.update(goals=c["goals"], assists=c["assists"], shots=c["shots"],
+                       points=c["goals"] + c["assists"])
+
+
 def fetch_game(get, gid, info, ctx, season_id):
     box = get(f"{WEB}/gamecenter/{gid}/boxscore")
     if box.get("gameState") not in FINAL_STATES:
@@ -128,13 +155,13 @@ def fetch_game(get, gid, info, ctx, season_id):
                or info.get("last_period")
                or (box.get("periodDescriptor") or {}).get("periodType") or "REG")
     by_game = box.get("playerByGameStats") or {}
-    players, skaters = [], {}
+    players, side_rows = [], {}
     for side, other, is_home in (("homeTeam", "awayTeam", True), ("awayTeam", "homeTeam", False)):
         team, opp = box[side]["abbrev"], box[other]["abbrev"]
         base = {"season": season_id, "game_id": gid, "game_date": info["date"],
                 "team": team, "opponent": opp, "home": is_home}
         group = by_game.get(side) or {}
-        skaters[side] = []
+        side_rows[side] = []
         for p in (group.get("forwards") or []) + (group.get("defense") or []):
             pid = str(p.get("playerId"))
             row = {
@@ -152,28 +179,46 @@ def fetch_game(get, gid, info, ctx, season_id):
                 "faceoff_pct": p.get("faceoffWinningPctg"),
             }
             players.append(row)
-            skaters[side].append(row)
+            side_rows[side].append(row)
         for g in group.get("goalies") or []:
             toi = minutes(g.get("toi"))
             if not toi:                     # dressed as the backup but didn't play
                 continue
             pid = str(g.get("playerId"))
             saves, against = _goalie_shots(g)
-            players.append({
+            row = {
                 **base, "player_id": pid,
                 "player_name": ctx["names"].get(pid) or _text(g.get("name")),
                 "position": "G", "toi": toi, "pim": to_int(g.get("pim")),
+                # The box score normally leaves these out for goalies; see _fill_goalie_offense
+                "goals": to_int(g.get("goals")), "assists": to_int(g.get("assists")),
+                "points": to_int(g.get("points")), "shots": to_int(g.get("sog", g.get("shots"))),
                 "starter": g.get("starter"), "decision": g.get("decision"),
                 "shots_against": against, "saves": saves,
                 "goals_against": to_int(g.get("goalsAgainst")),
-            })
+            }
+            players.append(row)
+            side_rows[side].append(row)
+
+    # Goalies occasionally shoot on goal or score (usually into an empty net), but the box
+    # score doesn't show it. If a team's player totals don't match its score or shots,
+    # fill in the goalies' goals, assists and shots from the play-by-play.
+    for side, other in (("homeTeam", "awayTeam"), ("awayTeam", "homeTeam")):
+        goals = to_int(box[side].get("score"))
+        if decided == "SO" and goals is not None and goals > (to_int(box[other].get("score")) or 0):
+            goals -= 1
+        sog = to_int(box[side].get("sog"))
+        if (_sum(side_rows[side], "goals") != goals
+                or (sog is not None and _sum(side_rows[side], "shots") != sog)):
+            _fill_goalie_offense(get, gid, players)
+            break
     teams = []
     for side, other, is_home in (("homeTeam", "awayTeam", True), ("awayTeam", "homeTeam", False)):
         t, o = box[side], box[other]
         gf, ga = to_int(t.get("score")), to_int(o.get("score"))
         if gf is None or ga is None:
             raise RuntimeError("final score missing from the box score")
-        mine, theirs = skaters[side], skaters[other]
+        mine, theirs = side_rows[side], side_rows[other]
         shots_for = to_int(t.get("sog"))
         shots_against = to_int(o.get("sog"))
         teams.append({
@@ -218,9 +263,7 @@ def validate(players, teams, final_games, ctx):
                               f"goals, schedule says {expected}")
 
     sums = {}
-    for p in players:
-        if p["position"] == "G":
-            continue
+    for p in players:                   # goalies included: they can score and shoot too
         s = sums.setdefault((p["game_id"], p["team"]), {"goals": 0, "shots": 0})
         s["goals"] += int(p["goals"] or 0)
         s["shots"] += int(p["shots"] or 0)
