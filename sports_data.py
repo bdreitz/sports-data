@@ -20,7 +20,7 @@ import urllib.error
 import urllib.request
 from functools import lru_cache
 
-REPO = "YOUR_GITHUB_NAME/sports-data"
+REPO = "bdreitz/sports-data"
 
 _BASE = f"https://github.com/{REPO}/releases/download/data"
 
