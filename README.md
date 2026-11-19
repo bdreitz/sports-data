@@ -1,8 +1,8 @@
 # sports-data
 
 A daily GitHub Actions job that builds NFL, NBA and NHL game-by-game stats files in one
-consistent format and publishes them on this repository's **data** release, where the phone
-tools download them.
+consistent format and publishes them on this repository's **data** release, available
+for download.
 
 - **NFL** comes from nflverse's published files, reshaped to the shared format. Records are
   cross-checked against ESPN's standings.
