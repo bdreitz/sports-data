@@ -20,11 +20,23 @@ Standard library only, so it runs in a-Shell on iPhone.
 
     nfl("josh allen", stats=["Pass Yards", "passing_epa"])
                                  show exactly the stats you want, by readable name or column name
+
+    daily_report()               this morning's props report for today's games, all sports
+    daily()                      build that report now (games=5, games="season", min_hit=0.9 ...)
+
+    nfl_scan()                   consistent props (80%+ hit rate) for this week's NFL games
+    nba_scan(), nhl_scan()       ...for today's NBA / NHL games
+    nfl_scan(games=5)            over each player's last 5 games; games="season" for the whole season
+    nba_scan(team="NY")          one team; min_hit=0.9, top=50 and all_teams=True also work
+
+Every player and team table ends with three averages: the last 5 games, the last 10 games and
+the whole season.
 """
 import csv
 import datetime
 import io
 import json
+import os
 import re
 import urllib.error
 import urllib.request
@@ -35,7 +47,7 @@ try:
 except ImportError:
     shutil = None
 
-REPO = "bdreitz/sports-data"
+REPO = os.environ.get("SPORTS_DATA_REPO") or "bdreitz/sports-data"
 
 _BASE = f"https://github.com/{REPO}/releases/download/data"
 
@@ -44,13 +56,14 @@ _BASE = f"https://github.com/{REPO}/releases/download/data"
 # ---------------------------------------------------------------------------
 
 NFL_VIEWS = {
-    "QB": ["attempts", "completions", "passing_yards", "passing_tds", "rushing_yards", "rushing_tds"],
+    "QB": ["attempts", "completions", "passing_yards", "passing_tds", "passing_interceptions",
+           "rushing_yards", "rushing_tds", "fumbles"],
     "RB": ["carries", "rushing_yards", "rushing_tds", "targets", "receptions", "receiving_yards",
-           "receiving_tds"],
-    "WR": ["targets", "receptions", "receiving_yards", "rushing_yards", "total_tds"],
+           "receiving_tds", "fumbles"],
+    "WR": ["targets", "receptions", "receiving_yards", "rushing_yards", "total_tds", "fumbles"],
     "K": ["fg_made", "fg_att", "fg_long", "fg_made_40_49", "fg_made_50_plus", "pat_made", "pat_att",
-          "kick_points"],
-    "defense": ["def_tackles_solo", "def_tackle_assists", "def_sacks", "def_interceptions"],
+          "kick_points", "fumbles"],
+    "defense": ["def_tackles_solo", "def_tackle_assists", "def_sacks", "def_interceptions", "fumbles"],
 }
 NFL_VIEWS["FB"] = NFL_VIEWS["RB"]
 NFL_VIEWS["TE"] = NFL_VIEWS["WR"]
@@ -71,6 +84,8 @@ COMPUTED = {"nfl": {
     "total_tds": [("rushing_tds", 1), ("receiving_tds", 1)],
     "fg_made_50_plus": [("fg_made_50_59", 1), ("fg_made_60_", 1), ("fg_made_60_plus", 1)],
     "kick_points": [("fg_made", 3), ("pat_made", 1)],
+    "fumbles": [("sack_fumbles", 1), ("rushing_fumbles", 1), ("receiving_fumbles", 1)],
+    "fumbles_lost": [("sack_fumbles_lost", 1), ("rushing_fumbles_lost", 1), ("receiving_fumbles_lost", 1)],
 }}
 
 # ---------------------------------------------------------------------------
@@ -95,6 +110,7 @@ _KICKING = {
     "gwfg_made": "Game-Winning FG Made", "gwfg_att": "Game-Winning FG Att",
     "gwfg_missed": "Game-Winning FG Missed", "gwfg_blocked": "Game-Winning FG Blocked",
     "gwfg_distance": "Game-Winning FG Yards", "kick_points": "Kick Points",
+    "fumbles": "Fumbles", "fumbles_lost": "Fumbles Lost",
 }
 
 # Player stats (and anything a team table shares with them)
@@ -195,6 +211,11 @@ def _labels(today=None):
 
 @lru_cache(maxsize=None)
 def _download(name):
+    # The GitHub job points SPORTS_DATA_LOCAL at the files it just built
+    local = os.environ.get("SPORTS_DATA_LOCAL")
+    if local and os.path.exists(os.path.join(local, name)):
+        with open(os.path.join(local, name), encoding="utf-8") as f:
+            return f.read()
     request = urllib.request.Request(f"{_BASE}/{name}", headers={"User-Agent": "sports_data"})
     try:
         with urllib.request.urlopen(request, timeout=120) as response:
@@ -289,26 +310,68 @@ def _width():
         return 40
 
 
-def _grid(sport, title, games, columns, extra_rows=(), team=False):
-    """One row per stat, one column per game, split into blocks that fit the screen."""
+def _number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _average(sport, games, column):
+    """The average of a column over games ('-' if none have a number). For the Result column,
+    the record instead: W-L, W-L-T (NFL ties) or W-L-OTL (NHL)."""
+    if column == "result":
+        counts = {}
+        for g in games:
+            counts[g.get("result")] = counts.get(g.get("result"), 0) + 1
+        order = ["W", "L", "OTL"] if sport == "nhl" else ["W", "L", "T"]
+        record = [counts.get(r, 0) for r in order]
+        if order[-1] in ("T",) and not record[-1]:
+            record = record[:-1]
+        return "-".join(str(n) for n in record)
+    values = [_number(_value(sport, g, column)) for g in games]
+    values = [v for v in values if v is not None]
+    if not values:
+        return "-"
+    return f"{sum(values) / len(values):.1f}"
+
+
+def _grid(sport, title, games, columns, team=False, history=None):
+    """One row per stat, one column per game, then the averages over the last 5 games, the last
+    10 games and the season (taken from `history`, every game this season). Split into blocks
+    that fit the screen."""
+    history = history or games
     if sport == "nfl":
         heads = [f"W{g['week']}" for g in games]
     else:
         heads = [f"{int(g['game_date'][5:7])}/{int(g['game_date'][8:10])}" for g in games]
-    lines = [("", heads), ("Opponent", [("" if g["home"] == "1" else "@") + g["opponent"] for g in games])]
-    lines += list(extra_rows)
-    lines += [(_label(sport, c, team), [_cell(_value(sport, g, c)) for g in games]) for c in columns]
+    windows = [history[-5:], history[-10:], history]
+    lines = [("", heads + ["Avg", "Avg", "Avg"]),
+             ("Opponent", [("" if g["home"] == "1" else "@") + g["opponent"] for g in games]
+              + ["L5", "L10", "Season"])]
+    for c in columns:
+        cells = [_cell(_value(sport, g, c)) for g in games]
+        lines.append((_label(sport, c, team), cells + [_average(sport, w, c) for w in windows]))
     label_w = max(len(label) for label, _ in lines)
-    col_w = [max(len(cells[j]) for _, cells in lines) for j in range(len(games))]
-    blocks, current, used, width = [], [], label_w, _width()
-    for j, w in enumerate(col_w):
+    count = len(games) + 3
+    col_w = [max(len(cells[j]) for _, cells in lines) for j in range(count)]
+    width = _width()
+    blocks, current, used = [], [], label_w
+    for j, w in enumerate(col_w[:len(games)]):
         if current and used + 1 + w > width:
             blocks.append(current)
             current, used = [], label_w
         current.append(j)
         used += 1 + w
-    if current:
+    # The three averages stay together: beside the last games if they fit, else in their own block
+    averages = [len(games), len(games) + 1, len(games) + 2]
+    if current and used + 3 + sum(col_w[-3:]) <= width:
+        current += averages
         blocks.append(current)
+    else:
+        if current:
+            blocks.append(current)
+        blocks.append(averages)
     out = [title]
     for n, block in enumerate(blocks):
         if n:
@@ -383,7 +446,7 @@ def _show_player(sport, name, last, view, stats):
         available = set(_header(sport, "player_games")) | set(COMPUTED.get(sport, {}))
         columns = [c for c in view(latest["position"]) if c in available]
     title = f"{latest['player_name']} | {latest['position']} | {latest['team']} | {len(games)} games"
-    _grid(sport, title, games[-last:], columns)
+    _grid(sport, title, games[-last:], columns, history=games)
 
 
 def nfl(name, last=5, stats=None):
@@ -414,10 +477,10 @@ def _show_team(sport, team, last, view, stats):
         print(f"Use the team code: {', '.join(sorted(codes))}")
         return
     games = sorted((r for r in rows if r["team"] == want), key=lambda r: (r["game_date"], r["game_id"]))
-    wins = sum(1 for g in games if g["result"] == "W")
     columns = _resolve_stats(sport, "team_games", stats) if stats else \
         [c for c in view if c in set(_header(sport, "team_games"))]
-    _grid(sport, f"{want} | {len(games)} games | {wins} wins", games[-last:], columns, team=True)
+    _grid(sport, f"{want} | {len(games)} games | {_average(sport, games, 'result')}",
+          games[-last:], columns, team=True, history=games)
 
 
 def nfl_team(team, last=5, stats=None):
@@ -470,3 +533,504 @@ def nhl_columns(search=None, team=False):
 def nba_columns(search=None, team=False):
     """Every NBA stat: readable name, then column name. nba_columns("reb"), nba_columns(team=True)"""
     _columns("nba", search, team)
+
+
+# ---------------------------------------------------------------------------
+# Scanner: consistent player props for the coming games
+# ---------------------------------------------------------------------------
+
+# The stats the scanner checks, by position ("*" means every other position)
+SCAN_STATS = {
+    "nfl": {"QB": ["passing_yards", "passing_tds", "rushing_yards"],
+            "RB": ["carries", "rushing_yards", "receptions", "receiving_yards"],
+            "FB": ["carries", "rushing_yards", "receptions", "receiving_yards"],
+            "WR": ["receptions", "receiving_yards"],
+            "TE": ["receptions", "receiving_yards"]},
+    "nba": {"*": ["pts", "reb", "ast"]},
+    "nhl": {"G": ["saves"], "*": ["shots"]},
+}
+
+# Lines are tried in steps of this size (1 when not listed)
+SCAN_STEP = {"passing_yards": 10, "rushing_yards": 5, "receiving_yards": 5}
+
+# The lowest line worth showing, so the list isn't full of near-certain trivial lines.
+# Keys are (sport, position, stat); position "*" covers every position. Edit to taste.
+SCAN_FLOOR = {
+    ("nfl", "QB", "passing_yards"): 150, ("nfl", "QB", "passing_tds"): 1,
+    ("nfl", "QB", "rushing_yards"): 10,
+    ("nfl", "*", "carries"): 8, ("nfl", "*", "rushing_yards"): 20,
+    ("nfl", "*", "receptions"): 2, ("nfl", "*", "receiving_yards"): 15,
+    ("nba", "*", "pts"): 8, ("nba", "*", "reb"): 3, ("nba", "*", "ast"): 2,
+    ("nhl", "G", "saves"): 15, ("nhl", "*", "shots"): 2,
+}
+
+_SCAN_NAMES = {"passing_yards": "Pass Yards", "passing_tds": "Pass TDs", "rushing_yards": "Rush Yards",
+               "carries": "Rush Att", "receptions": "Receptions", "receiving_yards": "Rec Yards",
+               "pts": "Points", "reb": "Rebounds", "ast": "Assists", "saves": "Saves",
+               "shots": "Shots on Goal"}
+
+
+def _get_json(url):
+    request = urllib.request.Request(url, headers={"User-Agent": "sports_data"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _get_text(url):
+    request = urllib.request.Request(url, headers={"User-Agent": "sports_data"})
+    with urllib.request.urlopen(request, timeout=120) as response:
+        return response.read().decode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Time (US Eastern, worked out by hand so it doesn't need time zone files)
+# ---------------------------------------------------------------------------
+
+def _eastern(utc):
+    """A UTC datetime -> naive US Eastern time, with daylight saving time."""
+    if utc.tzinfo is not None:
+        utc = utc.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+
+    def sunday(month, nth):
+        first = datetime.date(utc.year, month, 1)
+        return first + datetime.timedelta(days=(6 - first.weekday()) % 7 + 7 * (nth - 1))
+    dst_start = datetime.datetime.combine(sunday(3, 2), datetime.time(7))     # 2am Eastern
+    dst_end = datetime.datetime.combine(sunday(11, 1), datetime.time(6))      # 2am Eastern
+    return utc + datetime.timedelta(hours=-4 if dst_start <= utc < dst_end else -5)
+
+
+def _today():
+    """Today's date in US Eastern time."""
+    return _eastern(datetime.datetime.now(datetime.timezone.utc)).date()
+
+
+def _parse_utc(text):
+    return datetime.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+
+
+def _clock(start):
+    if start is None:
+        return "Time TBD"
+    hour = start.hour % 12 or 12
+    return f"{hour}:{start.minute:02d} {'PM' if start.hour >= 12 else 'AM'} ET"
+
+
+# ---------------------------------------------------------------------------
+# Schedules
+# ---------------------------------------------------------------------------
+
+def _games_today(sport, day):
+    """Regular-season games on `day` (Eastern): [{"start", "home", "away"}], start in Eastern time."""
+    games = []
+    if sport == "nhl":
+        data = _get_json(f"https://api-web.nhle.com/v1/schedule/{day.isoformat()}")
+        for block in data.get("gameWeek", []):
+            if block.get("date") != day.isoformat():
+                continue
+            for g in block.get("games", []):
+                if g.get("gameType") != 2:
+                    continue
+                start = _eastern(_parse_utc(g["startTimeUTC"])) if g.get("startTimeUTC") else None
+                games.append({"start": start, "home": g["homeTeam"]["abbrev"], "away": g["awayTeam"]["abbrev"]})
+    elif sport == "nba":
+        data = _get_json("https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+                         f"?dates={day.strftime('%Y%m%d')}")
+        for event in data.get("events", []):
+            if (event.get("season") or {}).get("type", 2) != 2:
+                continue                                  # preseason or playoffs
+            sides = {c.get("homeAway"): c["team"]["abbreviation"]
+                     for c in (event.get("competitions") or [{}])[0].get("competitors", [])}
+            if "home" in sides and "away" in sides:
+                start = _eastern(_parse_utc(event["date"])) if event.get("date") else None
+                games.append({"start": start, "home": sides["home"], "away": sides["away"]})
+    else:
+        for g in _nfl_schedule():
+            if g.get("gameday") != day.isoformat() or g.get("game_type") != "REG":
+                continue
+            start = None
+            if re.match(r"^\d{1,2}:\d{2}$", g.get("gametime") or ""):
+                hour, minute = (int(x) for x in g["gametime"].split(":"))
+                start = datetime.datetime.combine(day, datetime.time(hour, minute))   # already Eastern
+            games.append({"start": start, "home": g["home_team"], "away": g["away_team"]})
+    return games
+
+
+@lru_cache(maxsize=None)
+def _nfl_schedule_text():
+    return _get_text("https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv")
+
+
+def _nfl_schedule():
+    return list(csv.DictReader(io.StringIO(_nfl_schedule_text())))
+
+
+def _slate(sport, day):
+    """{team: (opponent, is_home)} for the scan functions: `day` for NBA/NHL, the next week with
+    unplayed games for NFL. Returns (slate, description)."""
+    slate = {}
+    if sport in ("nhl", "nba"):
+        for g in _games_today(sport, day):
+            slate[g["home"]], slate[g["away"]] = (g["away"], True), (g["home"], False)
+        return slate, f"{day.month}/{day.day}"
+    season = _labels()["nfl"]
+    upcoming = [g for g in _nfl_schedule() if g.get("season") == season and g.get("game_type") == "REG"
+                and g.get("home_score") in ("", "NA")]
+    if not upcoming:
+        return {}, "no games left"
+    week = min(int(g["week"]) for g in upcoming)
+    for g in upcoming:
+        if int(g["week"]) == week:
+            slate[g["home_team"]], slate[g["away_team"]] = (g["away_team"], True), (g["home_team"], False)
+    return slate, f"week {week}"
+
+
+# ---------------------------------------------------------------------------
+# Finding consistent lines
+# ---------------------------------------------------------------------------
+
+def _floor(sport, position, stat):
+    return SCAN_FLOOR.get((sport, position, stat), SCAN_FLOOR.get((sport, "*", stat), 1))
+
+
+def _best_line(values, step, floor, min_hit):
+    """The highest line (a multiple of `step`, at least `floor`) he reached in at least `min_hit`
+    of the games. Returns (line, hits, hit rate) or None."""
+    n = len(values)
+    best = None
+    line = max(step, -(-floor // step) * step)
+    while line <= max(values):
+        hits = sum(1 for v in values if v >= line)
+        if hits / n >= min_hit - 1e-9:
+            best = (line, hits, hits / n)
+        else:
+            break
+        line += step
+    return best
+
+
+def _short_name(name):
+    parts = name.split()
+    return name if len(parts) < 2 else f"{parts[0][0]}.{' '.join(parts[1:])}"
+
+
+def _window(games):
+    """games=5, 10 (or any number) or "season" -> (how many games, or None for all; description)."""
+    if isinstance(games, str) and games.strip().lower() == "season":
+        return None, "season"
+    if isinstance(games, bool) or not isinstance(games, int) or games < 1:
+        raise ValueError('games must be a number like 5 or 10, or "season"')
+    return games, f"last {games} games"
+
+
+def _candidates(sport, size, min_hit, min_games, teams=None):
+    """Every player (on `teams`, or all) with a line he reached in at least min_hit of his
+    games in the window: dicts with name, team, position, stat, line, hits, n, rate, avg, low."""
+    rows = _rows(sport, "player_games")
+    # Each team's two most recent game dates, to skip players who've been out
+    team_dates = {}
+    for r in rows:
+        team_dates.setdefault(r["team"], set()).add(r["game_date"])
+    recent = {t: sorted(d)[-2] if len(d) > 1 else sorted(d)[-1] for t, d in team_dates.items()}
+
+    players = {}
+    for r in rows:
+        players.setdefault(r["player_id"], []).append(r)
+    found = []
+    for played in players.values():
+        played.sort(key=lambda r: (r["game_date"], r["game_id"]))
+        latest = played[-1]
+        position, team = latest["position"], latest["team"]
+        if teams is not None and team not in teams:
+            continue
+        if latest["game_date"] < recent.get(team, ""):
+            continue                                   # missed his team's last two games
+        if sport == "nhl":
+            stats = SCAN_STATS["nhl"]["G" if position == "G" else "*"]
+        else:
+            stats = SCAN_STATS[sport].get(position) or SCAN_STATS[sport].get("*", [])
+        for stat in stats:
+            pool = played
+            if sport == "nhl" and position == "G":
+                pool = [g for g in played if g.get("starter") == "1"]
+            window = pool if size is None else pool[-size:]
+            values = [_number(_value(sport, g, stat)) or 0.0 for g in window]
+            if len(values) < min_games:
+                continue
+            best = _best_line(values, SCAN_STEP.get(stat, 1), _floor(sport, position, stat), min_hit)
+            if best is None:
+                continue
+            line, hits, rate = best
+            average = sum(values) / len(values)
+            found.append({"name": latest["player_name"], "team": team, "position": position,
+                          "stat": stat, "line": line, "hits": hits, "n": len(values), "rate": rate,
+                          "avg": average, "low": min(values), "cushion": average / line})
+    found.sort(key=lambda c: (-c["rate"], -c["cushion"], c["name"]))
+    return found
+
+
+def _prop_lines(c):
+    line = c["line"]
+    return [f"{c['rate']:.0%} {_short_name(c['name'])} ({c['position']}, {c['team']})",
+            f"  {_SCAN_NAMES.get(c['stat'], c['stat'])} {line:g}+ (over {line - 0.5:g})",
+            f"  hit {c['hits']}/{c['n']} | avg {c['avg']:.1f} | low {c['low']:g}"]
+
+
+def _scan(sport, games, min_hit, top, team, day, all_teams, min_games):
+    size, span = _window(games)
+    day = day or _today()
+    slate, when = None, "all teams"
+    if team:
+        wanted = {t.strip().upper() for t in ([team] if isinstance(team, str) else team)}
+        slate = {t: None for t in wanted}
+        when = ", ".join(sorted(wanted))
+    elif not all_teams:
+        try:
+            slate, when = _slate(sport, day)
+        except Exception as e:
+            print(f"(Couldn't load the schedule: {e}. Scanning every team.)")
+            slate = None
+        if slate is not None and not slate:
+            print(f"No {sport.upper()} games found for {when}. Use all_teams=True to scan everyone.")
+            return
+    found = _candidates(sport, size, min_hit, min_games, set(slate) if slate is not None else None)
+
+    print(f"{sport.upper()} scan | {when} | {span} | {min_hit:.0%}+ hit rate")
+    if not found:
+        print("Nothing clears the bar. Try min_hit=0.75 or a different games= window.")
+        return
+    for c in found[:top]:
+        lines = _prop_lines(c)
+        opponent = slate.get(c["team"]) if slate else None
+        if opponent:
+            lines[0] += f" {'vs' if opponent[1] else '@'} {opponent[0]}"
+        print("\n".join(lines))
+    if len(found) > top:
+        print(f"({top} of {len(found)} shown; use top={len(found)} for all)")
+    if sport == "nhl" and any(c["position"] == "G" for c in found[:top]):
+        print("Goalie lines use only games he started: confirm he's starting tonight.")
+
+
+def nfl_scan(games=10, min_hit=0.80, top=25, team=None, all_teams=False, min_games=5):
+    """
+    Consistent NFL player props for the coming week: for each player, the highest line he
+    reached in at least min_hit of his games (default 80%: 8 of 10, 4 of 5).
+    QB: pass yards, pass TDs, rush yards. RB: rush att, rush yards, receptions, rec yards.
+    WR/TE: receptions, rec yards.
+    nfl_scan()                     this week's games, his last 10 games, 80%+ hit rate
+    nfl_scan(games=5)              his last 5 games
+    nfl_scan(games="season")       every game this season
+    nfl_scan(team="BUF")           one team (or a list: team=["BUF", "KC"])
+    nfl_scan(min_hit=0.9, top=50)  stricter, longer list
+    nfl_scan(all_teams=True)       every team, playing this week or not
+    min_games: players need at least this many games in the window (default 5)
+    """
+    _scan("nfl", games, min_hit, top, team, None, all_teams, min_games)
+
+
+def nba_scan(games=10, min_hit=0.80, top=25, team=None, day=None, all_teams=False, min_games=5):
+    """
+    Consistent NBA player props for today's games: points, rebounds and assists, each on its
+    own. day=datetime.date(2026, 11, 20) for another day. Other options as in nfl_scan.
+    """
+    _scan("nba", games, min_hit, top, team, day, all_teams, min_games)
+
+
+def nhl_scan(games=10, min_hit=0.80, top=25, team=None, day=None, all_teams=False, min_games=5):
+    """
+    Consistent NHL player props for today's games: shots on goal for skaters, saves for goalies
+    (goalies are judged only on games they started). Options as in nba_scan.
+    """
+    _scan("nhl", games, min_hit, top, team, day, all_teams, min_games)
+
+
+# ---------------------------------------------------------------------------
+# Records and matchups
+# ---------------------------------------------------------------------------
+
+def _records(sport):
+    """{team: season record}, e.g. "9-6", "10-5-2" (NHL W-L-OTL), "8-2-1" (NFL with a tie)."""
+    by_team = {}
+    for r in _rows(sport, "team_games"):
+        by_team.setdefault(r["team"], []).append(r)
+    return {team: _average(sport, games, "result") for team, games in by_team.items()}
+
+
+_GROUP_NAMES = {"G": "guards", "F": "forwards", "C": "centers"}
+_STAT_UNITS = {"pts": "pts", "reb": "reb", "ast": "ast"}
+
+
+def _nba_group(position):
+    """ESPN positions (G, F, C, PG, SG, SF, PF, G-F ...) -> G, F or C."""
+    position = (position or "").upper()
+    if position.startswith("C"):
+        return "C"
+    if position.startswith("F") or position in ("SF", "PF"):
+        return "F"
+    return "G"
+
+
+def _matchup_spec(sport, position, stat):
+    """(how to measure, column, what it means, the side being judged, 'defense' or 'offense')."""
+    if sport == "nfl":
+        if position in ("RB", "FB"):
+            return "team", "opp_rushing_yards", "rush yds/g", "run D", "defense"
+        if stat == "passing_tds":
+            return "team", "opp_passing_tds", "pass TDs/g", "pass D", "defense"
+        return "team", "opp_passing_yards", "pass yds/g", "pass D", "defense"
+    if sport == "nhl":
+        if position == "G":
+            return "team", "shots_for", "shots/g", "offense", "offense"
+        return "team", "shots_against", "shots/g", "D", "defense"
+    group = _nba_group(position)
+    return "position", stat, f"{_STAT_UNITS.get(stat, stat)}/g to {_GROUP_NAMES[group]}", "D", "defense"
+
+
+class _Matchups:
+    """Per-game averages for every team, built once per sport, to judge each prop's opponent."""
+
+    def __init__(self, sport):
+        self.sport = sport
+        self.team_rows = {}
+        for r in _rows(sport, "team_games"):
+            self.team_rows.setdefault(r["team"], []).append(r)
+        self.cache = {}
+        self.position_tables = None
+
+    def _team_table(self, column):
+        if column not in self.cache:
+            table = {}
+            for team, games in self.team_rows.items():
+                values = [_number(g.get(column)) for g in games]
+                values = [v for v in values if v is not None]
+                if values:
+                    table[team] = sum(values) / len(values)
+            self.cache[column] = table
+        return self.cache[column]
+
+    def _position_table(self, stat, group):
+        """{defense: stat allowed per game to players of this position group} (NBA)."""
+        if self.position_tables is None:
+            totals, games = {}, {}
+            for r in _rows(self.sport, "player_games"):
+                defense = r["opponent"]
+                games.setdefault(defense, set()).add(r["game_id"])
+                key = (defense, _nba_group(r["position"]))
+                bucket = totals.setdefault(key, {})
+                for s in ("pts", "reb", "ast"):
+                    bucket[s] = bucket.get(s, 0.0) + (_number(r.get(s)) or 0.0)
+            self.position_tables = (totals, {d: len(g) for d, g in games.items()})
+        totals, games = self.position_tables
+        return {d: totals.get((d, group), {}).get(stat, 0.0) / n for d, n in games.items() if n}
+
+    def describe(self, position, stat, opponent):
+        """Two lines judging the matchup for an over, or [] if there isn't enough data. Defense
+        numbers are what the opponent allows per game; goalie matchups use the opponent's
+        offense (shots on goal per game)."""
+        how, column, unit, side, kind = _matchup_spec(self.sport, position, stat)
+        table = (self._team_table(column) if how == "team"
+                 else self._position_table(stat, _nba_group(position)))
+        if opponent not in table or not table:
+            return []
+        value = table[opponent]
+        league = sum(table.values()) / len(table)
+        if kind == "defense":            # 1 = allows the least (toughest)
+            rank = 1 + sum(1 for v in table.values() if v < value - 1e-9)
+        else:                            # 1 = shoots the most
+            rank = 1 + sum(1 for v in table.values() if v > value + 1e-9)
+        change = value / league - 1 if league else 0.0
+        if change >= 0.05:
+            verdict = "favorable"
+        elif change <= -0.05:
+            verdict = "tough"
+        else:
+            verdict = "neutral"
+        if abs(change) < 0.005:
+            compared = "right at average"
+        else:
+            compared = f"{abs(change):.0%} {'more' if change > 0 else 'less'} than avg"
+        amount = f"{value:.0f}" if value >= 100 else f"{value:.1f}"
+        return [f"  {opponent} {side}: #{rank} of {len(table)}, {amount} {unit}",
+                f"  {compared} -> {verdict}"]
+
+
+# ---------------------------------------------------------------------------
+# Today's props across every sport
+# ---------------------------------------------------------------------------
+
+def daily(games=10, min_hit=0.80, min_games=5, per_game=8, day=None):
+    """
+    Consistent props for today's NFL, NBA and NHL games, in start-time order, grouped by game.
+    Each game shows both teams' records; each prop shows his hit rate and how the opponent's
+    defense (or, for goalies, offense) compares with the league.
+    daily()                       last 10 games, 80%+ hit rate, up to 8 props per game
+    daily(games=5), daily(games="season"), daily(min_hit=0.9), daily(per_game=20)
+    day=datetime.date(2026, 11, 22) for another day.
+    """
+    size, span = _window(games)
+    day = day or _today()
+    entries, notes = [], []
+    for sport in ("nfl", "nhl", "nba"):
+        try:
+            todays = _games_today(sport, day)
+        except Exception as e:
+            notes.append(f"{sport.upper()}: couldn't load today's schedule ({e})")
+            continue
+        if not todays:
+            continue
+        try:
+            teams = {g["home"] for g in todays} | {g["away"] for g in todays}
+            found = _candidates(sport, size, min_hit, min_games, teams)
+            records = _records(sport)
+            matchups = _Matchups(sport)
+        except Exception as e:
+            notes.append(f"{sport.upper()}: couldn't build props ({e})")
+            continue
+        for g in todays:
+            props = [c for c in found if c["team"] in (g["home"], g["away"])]
+            entries.append((g, sport, props[:per_game], len(props), records, matchups))
+
+    entries.sort(key=lambda e: (e[0]["start"] or datetime.datetime.max, e[1], e[0]["away"], e[0]["home"]))
+    out = [f"Props for {day.strftime('%a')} {day.month}/{day.day}", f"{span} | {min_hit:.0%}+ hit rate"]
+    out += notes
+    if not entries:
+        out.append("No NFL, NBA or NHL games today." if not notes else "")
+    goalie = False
+    for g, sport, props, total, records, matchups in entries:
+        away, home = g["away"], g["home"]
+        out += ["", "=" * 34,
+                f"{_clock(g['start'])} | {sport.upper()}",
+                f"{away} ({records.get(away, '0-0')}) @ {home} ({records.get(home, '0-0')})",
+                "=" * 34]
+        if not props:
+            out.append("  nothing clears the bar")
+            continue
+        for c in props:
+            opponent = home if c["team"] == away else away
+            out += _prop_lines(c) + matchups.describe(c["position"], c["stat"], opponent)
+            goalie = goalie or (sport == "nhl" and c["position"] == "G")
+        if total > len(props):
+            out.append(f"  (+{total - len(props)} more: use per_game={total})")
+    if entries:
+        out += ["", "Defense ranks: #1 allows the least.",
+                "Goalie matchups rank the opponent's",
+                "offense: #1 shoots the most.",
+                "Verdicts are for the over: 5%+ above",
+                "average is favorable, 5%+ below tough."]
+        if goalie:
+            out += ["Goalie lines use only games he",
+                    "started: confirm he's starting."]
+    print("\n".join(out))
+
+
+def daily_report():
+    """Print the props report the GitHub job built this morning (fast: nothing to work out)."""
+    _download.cache_clear()
+    try:
+        report = _download("daily_props.txt")
+    except RuntimeError as e:
+        print(f"No published report yet ({e}). Run daily() to build one now.")
+        return
+    today = _today()
+    if f" {today.month}/{today.day} " not in report.split("\n", 1)[0] + " ":
+        print("(This report is from an earlier day. Run daily() for today's.)\n")
+    print(report)
