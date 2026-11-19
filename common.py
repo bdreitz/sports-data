@@ -279,7 +279,7 @@ def run_sport(sport, out_dir, today, full=False, get=None, load=None, log=print)
     schedule = sport.fetch_schedule(get, season, ctx)
     final = {gid: info for gid, info in schedule.items() if info["final"]}
     stored = {r["game_id"] for r in old_players} & {r["game_id"] for r in old_teams}
-    errors, warnings = [], list(ctx.get("warnings", []))
+    errors, warnings = [], []
     new_players, new_teams = {}, {}
 
     if hasattr(sport, "fetch_all"):
@@ -316,6 +316,7 @@ def run_sport(sport, out_dir, today, full=False, get=None, load=None, log=print)
 
     errors += check_structure(players, teams, final, sport.PLAYER_KEY, sport.TEAM_KEY)
     errors += sport.validate(players, teams, final, ctx)
+    warnings = list(ctx.get("warnings", [])) + warnings     # the sport's own, including validation's
     ok = not errors
 
     now = _now()
