@@ -38,6 +38,14 @@ Add page=False to print it all at once, or save=True to save it to a file.
                                  Player tables, scans and the daily report also show injury
                                  statuses, and leave off players who are out.
 
+    nfl_standings()              official standings: league, then each conference
+    nba_standings("east")        one conference (NFL: "afc" / "nfc"); "overall" = league only
+    nhl_standings()
+
+    nfl_leaders()                per-game player leaders (pass/rush/rec yards and TDs, receptions)
+    nba_leaders(), nhl_leaders() points/rebounds/assists; saves and shots on goal
+    nfl_leaders("rec yds", top=25, games=5, position="WR")
+
     nfl_scan()                   consistent props (80%+ hit rate) for this week's NFL games
     nba_scan(), nhl_scan()       ...for today's NBA / NHL games
     nfl_scan(games=5)            over each player's last 5 games; games="season" for the whole season
@@ -303,6 +311,12 @@ def _resolve_stats(sport, kind, stats):
     out = []
     for s in stats:
         column = by_name.get(_normalize(s))
+        if column is None:
+            # Common shorthand: "rec yds" -> "rec yards", "pass td" -> "pass tds"
+            words = {"yds": "yards", "yd": "yards", "yrds": "yards", "td": "tds",
+                     "touchdowns": "tds", "touchdown": "tds", "receiving": "rec",
+                     "rushing": "rush", "passing": "pass"}
+            column = by_name.get(" ".join(words.get(w, w) for w in _normalize(s).split()))
         if column is None:
             raise ValueError(f"'{s}' isn't one of the {sport.upper()} stats. "
                              f"Try {sport}_columns('{s.split()[0]}') to search.")
@@ -1224,6 +1238,329 @@ def nhl_injuries(team=None):
 
 
 # ---------------------------------------------------------------------------
+# Standings (official, checked live)
+# ---------------------------------------------------------------------------
+
+def _pct(value):
+    """0.706 -> '.706', 1.0 -> '1.000'."""
+    if value is None:
+        return "-"
+    text = f"{value:.3f}"
+    return text[1:] if text.startswith("0") else text
+
+
+def _espn_standings(sport):
+    """NFL / NBA standings from ESPN: one dict per team, with its conference."""
+    data = _get_json(f"https://site.api.espn.com/apis/v2/sports/{_ESPN_PATH[sport]}/standings")
+    groups = []
+
+    def walk(node, conference):
+        name = node.get("name") or ""
+        if "conference" in name.lower():
+            conference = (name, node.get("abbreviation") or "")
+        entries = (node.get("standings") or {}).get("entries")
+        if entries:
+            # Teams belong to the conference above them, even if ESPN nests divisions in between
+            conf_name, conf_abbr = conference if conference[0] else (name, node.get("abbreviation") or "")
+            groups.append((conf_name, conf_abbr, entries))
+        for child in node.get("children") or []:
+            walk(child, conference)
+    walk(data, ("", ""))
+    teams = []
+    for name, abbreviation, entries in groups:
+        for e in entries:
+            stats = {x.get("name"): x for x in e.get("stats", [])}
+
+            def value(key):
+                return stats.get(key, {}).get("value")
+
+            def shown(key):
+                return stats.get(key, {}).get("displayValue")
+            code = e["team"]["abbreviation"]
+            w, l, t = int(value("wins") or 0), int(value("losses") or 0), int(value("ties") or 0)
+            games = w + l + t
+            pct = value("winPercent")
+            if pct is None:
+                pct = (w + t / 2) / games if games else 0.0
+            teams.append({
+                "team": _ESPN_TO_OURS[sport].get(code, code), "conference": name,
+                "conf_abbr": abbreviation, "w": w, "l": l, "t": t, "pct": pct,
+                "gb": shown("gamesBehind") or "-", "streak": shown("streak") or "-",
+                "seed": value("playoffSeed"),
+                "pf": value("pointsFor"), "pa": value("pointsAgainst"),
+            })
+    if len(teams) < 30:
+        raise RuntimeError(f"ESPN returned only {len(teams)} teams")
+    return teams
+
+
+def _nhl_standings():
+    data = _get_json("https://api-web.nhle.com/v1/standings/now")
+    teams = []
+    for x in data.get("standings", []):
+        conference = x.get("conferenceName") or ""
+        streak = f"{x.get('streakCode') or ''}{x.get('streakCount') or ''}" or "-"
+        l10 = None
+        if x.get("l10Wins") is not None:
+            l10 = f"{x.get('l10Wins')}-{x.get('l10Losses')}-{x.get('l10OtLosses')}"
+        teams.append({
+            "team": (x.get("teamAbbrev") or {}).get("default", ""),
+            "conference": conference if "conference" in conference.lower() else f"{conference} Conference",
+            "conf_abbr": conference[:4], "gp": x.get("gamesPlayed") or 0,
+            "w": x.get("wins") or 0, "l": x.get("losses") or 0, "otl": x.get("otLosses") or 0,
+            "pts": x.get("points") or 0, "pct": x.get("pointPctg"), "gd": x.get("goalDifferential"),
+            "streak": streak, "l10": l10,
+            "conf_seq": x.get("conferenceSequence"), "league_seq": x.get("leagueSequence"),
+        })
+    if len(teams) < 30:
+        raise RuntimeError(f"the NHL returned only {len(teams)} teams")
+    return teams
+
+
+def _table(header, rows, left=(1,)):
+    """Columns sized to their contents: numbers right-aligned, columns in `left` left-aligned."""
+    widths = [max(len(str(r[i])) for r in [header] + rows) for i in range(len(header))]
+    lines = []
+    for r in [header] + rows:
+        cells = [str(c).ljust(w) if i in left else str(c).rjust(w) for i, (c, w) in enumerate(zip(r, widths))]
+        lines.append(" ".join(cells).rstrip())
+    return lines
+
+
+def _standings_rows(sport, teams):
+    if sport == "nhl":
+        header = ["#", "Team", "GP", "W-L-OT", "Pts", "P%", "GD", "Strk"]
+        rows = [[i, t["team"], t["gp"], f"{t['w']}-{t['l']}-{t['otl']}", t["pts"], _pct(t["pct"]),
+                 f"{t['gd']:+d}" if isinstance(t["gd"], int) else "-", t["streak"]]
+                for i, t in enumerate(teams, 1)]
+    elif sport == "nfl":
+        header = ["#", "Team", "W-L-T", "Pct", "PF", "PA", "Strk"]
+        rows = [[i, t["team"], f"{t['w']}-{t['l']}-{t['t']}", _pct(t["pct"]),
+                 int(t["pf"]) if t["pf"] is not None else "-", int(t["pa"]) if t["pa"] is not None else "-",
+                 t["streak"]] for i, t in enumerate(teams, 1)]
+    else:
+        header = ["#", "Team", "W-L", "Pct", "GB", "Strk"]
+        rows = [[i, t["team"], f"{t['w']}-{t['l']}", _pct(t["pct"]), t["gb"], t["streak"]]
+                for i, t in enumerate(teams, 1)]
+    return _table(header, rows)
+
+
+def _section(title, lines):
+    return ["", "=" * 34, title, "=" * 34] + lines
+
+
+def _standings(sport, view):
+    want = _normalize(view) if view else ""
+    try:
+        teams = _nhl_standings() if sport == "nhl" else _espn_standings(sport)
+        checked = _eastern(datetime.datetime.now(datetime.timezone.utc))
+    except Exception as e:
+        _standings_from_files(sport, e)
+        return
+    if sport == "nhl":
+        overall = sorted(teams, key=lambda t: (t["league_seq"] or 99, -t["pts"], -(t["pct"] or 0)))
+        note = "Sorted by points (league order)."
+    else:
+        overall = sorted(teams, key=lambda t: (-t["pct"], -t["w"], t["team"]))
+        note = "Overall sorted by win %."
+    conferences = []
+    for name in sorted({t["conference"] for t in teams if t["conference"]}):
+        members = [t for t in teams if t["conference"] == name]
+        if sport == "nhl":
+            members.sort(key=lambda t: (t["conf_seq"] or 99, -t["pts"]))
+        else:
+            members.sort(key=lambda t: (t["seed"] if t["seed"] else 99, -t["pct"], -t["w"]))
+        conferences.append((name, members))
+
+    out = [f"{sport.upper()} standings | checked {_clock(checked)}"]
+    show_overall = want in ("", "overall", "league", "all")
+    shown = 0
+    if show_overall:
+        out += _section("League", _standings_rows(sport, overall))
+        shown += 1
+    for name, members in conferences:
+        abbreviation = _normalize(members[0].get("conf_abbr") or "")
+        alias = {"afc": "american", "nfc": "national"}.get(want, want)
+        if want and not show_overall and alias not in _normalize(name) and want != abbreviation:
+            continue
+        if want in ("overall", "league"):
+            continue
+        out += _section(name, _standings_rows(sport, members))
+        shown += 1
+    if shown == 0:
+        names = ", ".join(n for n, _ in conferences)
+        print(f"No {sport.upper()} conference matches '{view}'. Conferences: {names}")
+        return
+    out += ["", note]
+    if sport != "nhl":
+        out.append("Conferences in playoff-seed order.")
+    if sport == "nba":
+        out.append("GB = games behind the leader.")
+    if sport == "nhl":
+        out.append("P% = points %, GD = goal difference.")
+    print("\n".join(out))
+
+
+def _standings_from_files(sport, error):
+    """Overall standings from the published game files, when the live standings can't load."""
+    by_team = {}
+    for r in _rows(sport, "team_games"):
+        by_team.setdefault(r["team"], []).append(r)
+    rows = []
+    for team, games in by_team.items():
+        counts = {}
+        for g in games:
+            counts[g["result"]] = counts.get(g["result"], 0) + 1
+        w, l = counts.get("W", 0), counts.get("L", 0)
+        other = counts.get("OTL", 0) + counts.get("T", 0)
+        points = 2 * w + other if sport == "nhl" else None
+        pct = (w + (other / 2 if sport == "nfl" else 0)) / len(games) if games else 0.0
+        rows.append((team, w, l, other, pct, points, len(games)))
+    if sport == "nhl":
+        rows.sort(key=lambda r: (-r[5], r[6], r[0]))
+        table = _table(["#", "Team", "GP", "W-L-OT", "Pts"],
+                       [[i, r[0], r[6], f"{r[1]}-{r[2]}-{r[3]}", r[5]] for i, r in enumerate(rows, 1)])
+    else:
+        rows.sort(key=lambda r: (-r[4], -r[1], r[0]))
+        record = (lambda r: f"{r[1]}-{r[2]}-{r[3]}") if sport == "nfl" else (lambda r: f"{r[1]}-{r[2]}")
+        table = _table(["#", "Team", "W-L-T" if sport == "nfl" else "W-L", "Pct"],
+                       [[i, r[0], record(r), _pct(r[4])] for i, r in enumerate(rows, 1)])
+    print(f"Live {sport.upper()} standings couldn't load ({error}).")
+    print("Overall records from your data files")
+    print("(no conferences or tiebreakers):")
+    print("\n".join(_section("League", table)))
+
+
+@_paged
+def nfl_standings(view=None):
+    """NFL standings: nfl_standings() for the league and both conferences,
+    nfl_standings("afc") or ("nfc") for one conference, nfl_standings("overall") for the league."""
+    _standings("nfl", view)
+
+
+@_paged
+def nba_standings(view=None):
+    """NBA standings: nba_standings() for the league and both conferences,
+    nba_standings("east") or ("west") for one conference, nba_standings("overall") for the league."""
+    _standings("nba", view)
+
+
+@_paged
+def nhl_standings(view=None):
+    """NHL standings: nhl_standings() for the league and both conferences,
+    nhl_standings("east") or ("west") for one conference, nhl_standings("overall") for the league."""
+    _standings("nhl", view)
+
+
+# ---------------------------------------------------------------------------
+# Player leaderboards
+# ---------------------------------------------------------------------------
+
+LEADER_STATS = {
+    "nfl": ["passing_yards", "passing_tds", "rushing_yards", "rushing_tds", "receptions",
+            "receiving_yards"],
+    "nba": ["pts", "reb", "ast"],
+    "nhl": ["saves", "shots"],
+}
+_GOALIE_STATS = {"saves", "shots_against", "goals_against"}
+
+
+def _leaders(sport, stat, top, games, min_games, team, position):
+    size, span = _window(games)
+    rows = _rows(sport, "player_games")
+    if stat is None:
+        stats = LEADER_STATS[sport]
+    else:
+        stats = _resolve_stats(sport, "player_games", [stat] if isinstance(stat, str) else list(stat))
+    teams = None
+    if team:
+        teams = {t.strip().upper() for t in ([team] if isinstance(team, str) else team)}
+    positions = None
+    if position:
+        items = [position] if isinstance(position, str) else list(position)
+        positions = {p.strip().upper() for item in items for p in str(item).replace("/", ",").split(",") if p.strip()}
+
+    team_games = {}
+    for r in rows:
+        team_games.setdefault(r["team"], set()).add(r["game_id"])
+    players = {}
+    for r in rows:
+        players.setdefault(r["player_id"], []).append(r)
+    for played in players.values():
+        played.sort(key=lambda r: (r["game_date"], r["game_id"]))
+
+    rule = f"min {min_games} games" if min_games is not None else "min half his team's games"
+    filters = []
+    if teams:
+        filters.append(", ".join(sorted(teams)))
+    if positions:
+        filters.append("/".join(sorted(positions)))
+    out = [f"{sport.upper()} leaders | {span}", rule + (f" | {' | '.join(filters)}" if filters else "")]
+    for st in stats:
+        board = []
+        for played in players.values():
+            latest = played[-1]
+            if teams and latest["team"] not in teams:
+                continue
+            if positions and (latest["position"] or "").upper() not in positions:
+                continue
+            if sport == "nhl" and (latest["position"] == "G") != (st in _GOALIE_STATS):
+                continue                            # goalie boards: goalies; others: skaters
+            window = played if size is None else played[-size:]
+            possible = len(team_games.get(latest["team"], ()))
+            if size is not None:
+                possible = min(size, possible)
+            needed = min_games if min_games is not None else max(1, possible // 2)
+            if len(window) < needed:
+                continue
+            values = [_number(_value(sport, g, st)) or 0.0 for g in window]
+            total = sum(values)
+            if total == 0:
+                continue
+            board.append({"name": latest["player_name"], "position": latest["position"] or "-",
+                          "team": latest["team"], "gp": len(window), "avg": total / len(window),
+                          "total": total})
+        board.sort(key=lambda b: (-b["avg"], -b["total"], b["name"]))
+        title = f"{_label(sport, st)} per game"
+        if not board:
+            out += _section(title, ["  nobody qualifies"])
+            continue
+        table = _table(["#", "Player", "Pos", "Team", "GP", "Per G", "Total"],
+                       [[i, _short_name(b["name"])[:15], b["position"], b["team"], b["gp"],
+                         f"{b['avg']:.2f}" if b["avg"] < 2 else f"{b['avg']:.1f}", _cell(b["total"])]
+                        for i, b in enumerate(board[:top], 1)],
+                       left=(1, 2, 3))
+        out += _section(title, table)
+    print("\n".join(out))
+
+
+@_paged
+def nfl_leaders(stat=None, top=10, games="season", min_games=None, team=None, position=None):
+    """
+    NFL per-game leaders: pass yards, pass TDs, rush yards, rush TDs, receptions, rec yards.
+    nfl_leaders()                  every board, top 10, this season
+    nfl_leaders("rec yds")         one board (readable or column name; see nfl_columns())
+    nfl_leaders(top=25, games=5)   top 25 over each player's last 5 games
+    nfl_leaders(position="WR,TE"), nfl_leaders(team="BUF")
+    min_games: games needed to qualify (default: half his team's games)
+    """
+    _leaders("nfl", stat, top, games, min_games, team, position)
+
+
+@_paged
+def nba_leaders(stat=None, top=10, games="season", min_games=None, team=None, position=None):
+    """NBA per-game leaders: points, rebounds, assists. Options as in nfl_leaders()."""
+    _leaders("nba", stat, top, games, min_games, team, position)
+
+
+@_paged
+def nhl_leaders(stat=None, top=10, games="season", min_games=None, team=None, position=None):
+    """NHL per-game leaders: saves (goalies) and shots on goal (skaters). Options as in
+    nfl_leaders(); position="D" for defensemen, "C,L,R" for forwards."""
+    _leaders("nhl", stat, top, games, min_games, team, position)
+
+
+# ---------------------------------------------------------------------------
 # Records and matchups
 # ---------------------------------------------------------------------------
 
@@ -1461,6 +1798,8 @@ Most used:
   daily()               a fresh report
   nfl("josh allen")     a player
   nfl_team("BUF")       a team
+  nba_standings()       standings
+  nfl_leaders()         player leaders
   nba_scan()            today's props
   nba_injuries("NY")    a team's
                         injury report
@@ -1945,8 +2284,116 @@ A wrong code lists the valid ones:
   nba_team("NYK")
 ''')
 
-_GUIDE_ORDER = ["start", "report", "daily", "players", "teams", "scan", "injuries",
-                "columns", "status", "paging", "settings", "codes"]
+GUIDE["standings"] = ("nfl_standings() etc.: standings", '''
+STANDINGS: nfl_standings(),
+nba_standings(), nhl_standings()
+
+Official standings, checked live: the
+whole league, then each conference.
+One section per page.
+
+Usage:
+  nba_standings()           league and
+                            conferences
+  nba_standings("east")     one
+                            conference
+  nba_standings("overall")  league only
+  nfl_standings("afc")
+  nfl_standings("nfc")
+  nhl_standings("west")
+
+Options:
+  view=None     "overall", or a
+                conference: "east" /
+                "west" (NBA, NHL),
+                "afc" / "nfc" (NFL)
+  page, save    see guide("paging")
+
+Columns:
+  NFL: W-L-T, Pct, PF (points for), PA
+    (points against), Strk (streak)
+  NBA: W-L, Pct, GB (games behind the
+    leader), Strk
+  NHL: GP, W-L-OT, Pts, P% (points %),
+    GD (goal difference), Strk
+
+The league table is sorted by win %
+(NHL: points). Conferences are in
+playoff-seed order (NHL: conference
+standing).
+
+Output (made up):
+NBA standings | checked 3:05 PM ET
+
+==================================
+Eastern Conference
+==================================
+ # Team  W-L  Pct  GB Strk
+ 1 BOS  16-2 .889   -   W2
+ 2 NY   15-3 .833 1.0   W5
+...
+
+If the live standings can't load, it
+shows overall records from your data
+files instead (no conferences).
+''')
+
+GUIDE["leaders"] = ("nfl_leaders() etc.: player leaders", '''
+PLAYER LEADERS: nfl_leaders(),
+nba_leaders(), nhl_leaders()
+
+Per-game leaderboards, one per page.
+
+Boards:
+  NFL: pass yards, pass TDs, rush
+    yards, rush TDs, receptions, rec
+    yards
+  NBA: points, rebounds, assists
+  NHL: saves (goalies), shots on goal
+    (skaters)
+
+Usage:
+  nfl_leaders()
+  nfl_leaders("rec yds")
+  nfl_leaders(top=25)
+  nfl_leaders(games=5)
+  nfl_leaders(position="WR,TE")
+  nfl_leaders(team="BUF")
+  nba_leaders("assists", top=20)
+  nhl_leaders(position="D")
+
+Options (defaults first):
+  stat=None     one board (readable or
+                column name; see
+                guide("columns")), or a
+                list
+  top=10        players per board
+  games="season"  or 5, 10, any number:
+                each player's last N
+  min_games=None  games needed; default
+                half his team's games
+                (in the window)
+  team=None     a team code or a list
+  position=None  "WR", "WR,TE", "D" ...
+  page, save    see guide("paging")
+
+Per game = per game played.
+
+Output (made up):
+NFL leaders | season
+min half his team's games
+
+==================================
+Rec Yards per game
+==================================
+ # Player      Pos Team GP Per G Total
+ 1 J.Chase     WR  CIN  11 104.2  1146
+ 2 J.Jefferson WR  MIN  11  98.7  1086
+...
+''')
+
+_GUIDE_ORDER = ["start", "report", "daily", "players", "teams", "standings", "leaders",
+                "scan", "injuries", "columns", "status", "paging", "settings", "codes"]
 _GUIDE_ALIASES = {
     "daily_report": "report", "players": "players", "player": "players", "nfl": "players",
     "nba": "players", "nhl": "players", "team": "teams", "nfl_team": "teams",
@@ -1956,6 +2403,11 @@ _GUIDE_ALIASES = {
     "column": "columns", "nfl_columns": "columns", "nba_columns": "columns",
     "nhl_columns": "columns", "stats": "columns", "page": "paging", "save": "paging",
     "setting": "settings", "code": "codes", "getting started": "start", "help": "start",
+    "standing": "standings", "nfl_standings": "standings", "nba_standings": "standings",
+    "nhl_standings": "standings", "records": "standings",
+    "leader": "leaders", "nfl_leaders": "leaders", "nba_leaders": "leaders",
+    "nhl_leaders": "leaders", "player standings": "leaders", "player_standings": "leaders",
+    "leaderboard": "leaders", "leaderboards": "leaders",
     "usage": "start", "guide": "start",
 }
 
