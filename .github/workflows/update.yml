@@ -43,7 +43,7 @@ jobs:
           SPORTS_DATA_LOCAL: out
           SPORTS_DATA_REPO: ${{ github.repository }}
         run: |
-          python -c "import sports_data; sports_data.daily()" > daily_props.txt
+          python -c "import sports_data; sports_data.daily(page=False)" > daily_props.txt
           cat daily_props.txt
           mv daily_props.txt out/daily_props.txt
 
