@@ -21,8 +21,19 @@ Standard library only, so it runs in a-Shell on iPhone.
     nfl("josh allen", stats=["Pass Yards", "passing_epa"])
                                  show exactly the stats you want, by readable name or column name
 
-    daily_report()               this morning's props report for today's games, all sports
+    daily_report()               this morning's props report for today's games, all sports,
+                                 one game at a time: Return = next game, a = all, q = quit
+    daily_report(save=True)      save it to a text file instead (Files app > a-Shell), to open,
+                                 scroll, or Share > Notes
     daily()                      build that report now (games=5, games="season", min_hit=0.9 ...)
+
+Long output (daily, daily_report, the scans and the column lists) is shown a page at a time.
+Add page=False to print it all at once, or save=True to save it to a file.
+
+    nfl_injuries("BUF")          a team's injury report (nfl_injuries() for the whole league)
+    nba_injuries("NY"), nhl_injuries("NYR")
+                                 Player tables, scans and the daily report also show injury
+                                 statuses, and leave off players who are out.
 
     nfl_scan()                   consistent props (80%+ hit rate) for this week's NFL games
     nba_scan(), nhl_scan()       ...for today's NBA / NHL games
@@ -32,12 +43,17 @@ Standard library only, so it runs in a-Shell on iPhone.
 Every player and team table ends with three averages: the last 5 games, the last 10 games and
 the whole season.
 """
+import contextlib
 import csv
 import datetime
+import functools
 import io
 import json
 import os
 import re
+import textwrap
+import time
+import unicodedata
 import urllib.error
 import urllib.request
 from functools import lru_cache
@@ -446,6 +462,9 @@ def _show_player(sport, name, last, view, stats):
         available = set(_header(sport, "player_games")) | set(COMPUTED.get(sport, {}))
         columns = [c for c in view(latest["position"]) if c in available]
     title = f"{latest['player_name']} | {latest['position']} | {latest['team']} | {len(games)} games"
+    status = _injury_line(sport, latest["player_name"], latest["team"])
+    if status:
+        title += "\n" + status
     _grid(sport, title, games[-last:], columns, history=games)
 
 
@@ -479,8 +498,9 @@ def _show_team(sport, team, last, view, stats):
     games = sorted((r for r in rows if r["team"] == want), key=lambda r: (r["game_date"], r["game_id"]))
     columns = _resolve_stats(sport, "team_games", stats) if stats else \
         [c for c in view if c in set(_header(sport, "team_games"))]
-    _grid(sport, f"{want} | {len(games)} games | {_average(sport, games, 'result')}",
-          games[-last:], columns, team=True, history=games)
+    title = f"{want} | {len(games)} games | {_average(sport, games, 'result')}"
+    title += "\n" + "\n".join(_injury_summary_or_note(sport, [want]))
+    _grid(sport, title, games[-last:], columns, team=True, history=games)
 
 
 def nfl_team(team, last=5, stats=None):
@@ -520,16 +540,80 @@ def _columns(sport, search, team):
     print(f"({len(columns)} {'team ' if team else ''}stats. Use either name in stats=[...])")
 
 
+# ---------------------------------------------------------------------------
+# Paging and saving long output
+# ---------------------------------------------------------------------------
+
+PAGE_LINES = 30     # lines per page for output that isn't split by game
+
+
+def _pages(text, lines):
+    """Split a report into one page per game (the title rides with the first game); split
+    anything else into pages of `lines` lines."""
+    blocks = re.split(r"\n\n(?==)", text)
+    if len(blocks) > 1:
+        return ["\n\n".join(blocks[:2])] + blocks[2:]
+    rows = text.split("\n")
+    return ["\n".join(rows[i:i + lines]) for i in range(0, len(rows), lines)] or [""]
+
+
+def _show(text, page=True, save=False, name="output"):
+    if save:
+        filename = f"{name}_{_today().isoformat()}.txt"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(text + "\n")
+        print(f"Saved to {filename} in a-Shell's folder.")
+        print("Files app > On My iPhone > a-Shell >")
+        print(f"{filename}: open it to scroll, or tap")
+        print("Share > Notes to copy it into a note.")
+        return
+    if not page:
+        print(text)
+        return
+    pages = _pages(text, page if isinstance(page, int) and not isinstance(page, bool) and page > 1
+                   else PAGE_LINES)
+    for i, chunk in enumerate(pages):
+        print(chunk)
+        if i == len(pages) - 1:
+            return
+        try:
+            answer = input(f"\n-- {i + 1}/{len(pages)}: Return=next a=all q=quit -- ").strip().lower()
+        except EOFError:                # no keyboard (e.g. run by a script): show the rest
+            answer = "a"
+        if answer == "q":
+            return
+        if answer == "a":
+            print("\n\n".join(pages[i + 1:]))
+            return
+        print()
+
+
+def _paged(func):
+    """Let a printing function take page= and save=:
+    page=True (default) shows a game, or PAGE_LINES lines, at a time; page=False prints it all;
+    page=20 sets the lines per page. save=True writes it to a text file instead."""
+    @functools.wraps(func)
+    def wrapper(*args, page=True, save=False, **kwargs):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            func(*args, **kwargs)
+        _show(buffer.getvalue().rstrip("\n"), page, save, func.__name__)
+    return wrapper
+
+
+@_paged
 def nfl_columns(search=None, team=False):
     """Every NFL stat: readable name, then column name. nfl_columns("rush"), nfl_columns(team=True)"""
     _columns("nfl", search, team)
 
 
+@_paged
 def nhl_columns(search=None, team=False):
     """Every NHL stat: readable name, then column name. nhl_columns("shot"), nhl_columns(team=True)"""
     _columns("nhl", search, team)
 
 
+@_paged
 def nba_columns(search=None, team=False):
     """Every NBA stat: readable name, then column name. nba_columns("reb"), nba_columns(team=True)"""
     _columns("nba", search, team)
@@ -763,19 +847,45 @@ def _candidates(sport, size, min_hit, min_games, teams=None):
             average = sum(values) / len(values)
             found.append({"name": latest["player_name"], "team": team, "position": position,
                           "stat": stat, "line": line, "hits": hits, "n": len(values), "rate": rate,
-                          "avg": average, "low": min(values), "cushion": average / line})
+                          "avg": average, "low": min(values), "cushion": average / line,
+                          "pool": pool})
     found.sort(key=lambda c: (-c["rate"], -c["cushion"], c["name"]))
     return found
 
 
 def _prop_lines(c):
     line = c["line"]
-    return [f"{c['rate']:.0%} {_short_name(c['name'])} ({c['position']}, {c['team']})",
-            f"  {_SCAN_NAMES.get(c['stat'], c['stat'])} {line:g}+ (over {line - 0.5:g})",
-            f"  hit {c['hits']}/{c['n']} | avg {c['avg']:.1f} | low {c['low']:g}"]
+    lines = [f"{c['rate']:.0%} {_short_name(c['name'])} ({c['position']}, {c['team']})"]
+    if c.get("injury"):
+        lines.append(f"  ! {c['injury']}")
+    return lines + [f"  {_SCAN_NAMES.get(c['stat'], c['stat'])} {line:g}+ (over {line - 0.5:g})",
+                    f"  hit {c['hits']}/{c['n']} | avg {c['avg']:.1f} | low {c['low']:g}"]
 
 
-def _scan(sport, games, min_hit, top, team, day, all_teams, min_games):
+def _log_lines(c, log):
+    """The prop's stat in his last `log` games, oldest first: opponent and value, with * on
+    the games he fell short of the line. Laid out in columns that fit the screen."""
+    if not log:
+        return []
+    recent = c["pool"][-log:]
+    if not recent:
+        return []
+    opponents, values = [], []
+    for g in recent:
+        value = _number(g.get(c["stat"])) or 0.0
+        opponents.append(("" if g["home"] == "1" else "@") + g["opponent"])
+        values.append(_cell(value) + ("*" if value < c["line"] - 1e-9 else " "))
+    opp_w = max(len(o) for o in opponents)
+    val_w = max(len(v) for v in values)
+    cells = [f"{o.rjust(opp_w)} {v.rjust(val_w)}" for o, v in zip(opponents, values)]
+    per_line = max(1, (min(_width(), 40) - 2 + 1) // (len(cells[0]) + 1))
+    lines = [f"  last {len(recent)} (oldest first, * = missed):"]
+    for i in range(0, len(cells), per_line):
+        lines.append(("  " + " ".join(cells[i:i + per_line])).rstrip())
+    return lines
+
+
+def _scan(sport, games, min_hit, top, team, day, all_teams, min_games, log=10):
     size, span = _window(games)
     day = day or _today()
     slate, when = None, "all teams"
@@ -793,8 +903,12 @@ def _scan(sport, games, min_hit, top, team, day, all_teams, min_games):
             print(f"No {sport.upper()} games found for {when}. Use all_teams=True to scan everyone.")
             return
     found = _candidates(sport, size, min_hit, min_games, set(slate) if slate is not None else None)
+    found, dropped, injury_note = _apply_injuries(sport, found)
 
     print(f"{sport.upper()} scan | {when} | {span} | {min_hit:.0%}+ hit rate")
+    print(injury_note)
+    if dropped:
+        print("Out, left off: " + ", ".join(_short_name(n) for n, _ in dropped))
     if not found:
         print("Nothing clears the bar. Try min_hit=0.75 or a different games= window.")
         return
@@ -803,14 +917,15 @@ def _scan(sport, games, min_hit, top, team, day, all_teams, min_games):
         opponent = slate.get(c["team"]) if slate else None
         if opponent:
             lines[0] += f" {'vs' if opponent[1] else '@'} {opponent[0]}"
-        print("\n".join(lines))
+        print("\n".join(lines + _log_lines(c, log)))
     if len(found) > top:
         print(f"({top} of {len(found)} shown; use top={len(found)} for all)")
     if sport == "nhl" and any(c["position"] == "G" for c in found[:top]):
         print("Goalie lines use only games he started: confirm he's starting tonight.")
 
 
-def nfl_scan(games=10, min_hit=0.80, top=25, team=None, all_teams=False, min_games=5):
+@_paged
+def nfl_scan(games=10, min_hit=0.80, top=25, team=None, all_teams=False, min_games=5, log=10):
     """
     Consistent NFL player props for the coming week: for each player, the highest line he
     reached in at least min_hit of his games (default 80%: 8 of 10, 4 of 5).
@@ -823,24 +938,285 @@ def nfl_scan(games=10, min_hit=0.80, top=25, team=None, all_teams=False, min_gam
     nfl_scan(min_hit=0.9, top=50)  stricter, longer list
     nfl_scan(all_teams=True)       every team, playing this week or not
     min_games: players need at least this many games in the window (default 5)
+    log: how many of his recent games to list under each prop (default 10; 0 hides it)
     """
-    _scan("nfl", games, min_hit, top, team, None, all_teams, min_games)
+    _scan("nfl", games, min_hit, top, team, None, all_teams, min_games, log)
 
 
-def nba_scan(games=10, min_hit=0.80, top=25, team=None, day=None, all_teams=False, min_games=5):
+@_paged
+def nba_scan(games=10, min_hit=0.80, top=25, team=None, day=None, all_teams=False, min_games=5,
+             log=10):
     """
     Consistent NBA player props for today's games: points, rebounds and assists, each on its
     own. day=datetime.date(2026, 11, 20) for another day. Other options as in nfl_scan.
     """
-    _scan("nba", games, min_hit, top, team, day, all_teams, min_games)
+    _scan("nba", games, min_hit, top, team, day, all_teams, min_games, log)
 
 
-def nhl_scan(games=10, min_hit=0.80, top=25, team=None, day=None, all_teams=False, min_games=5):
+@_paged
+def nhl_scan(games=10, min_hit=0.80, top=25, team=None, day=None, all_teams=False, min_games=5,
+             log=10):
     """
     Consistent NHL player props for today's games: shots on goal for skaters, saves for goalies
     (goalies are judged only on games they started). Options as in nba_scan.
     """
-    _scan("nhl", games, min_hit, top, team, day, all_teams, min_games)
+    _scan("nhl", games, min_hit, top, team, day, all_teams, min_games, log)
+
+
+# ---------------------------------------------------------------------------
+# Injuries (ESPN's injury reports, checked live)
+# ---------------------------------------------------------------------------
+
+_ESPN_PATH = {"nfl": "football/nfl", "nba": "basketball/nba", "nhl": "hockey/nhl"}
+# ESPN team code -> the code in our files, where they differ (NBA files already use ESPN's)
+_ESPN_TO_OURS = {"nfl": {"LAR": "LA", "WSH": "WAS"},
+                 "nhl": {"TB": "TBL", "NJ": "NJD", "LA": "LAK", "SJ": "SJS", "UTAH": "UTA"},
+                 "nba": {}}
+INJURY_REFRESH_MINUTES = 10
+_injury_cache = {}
+
+
+def _person(name):
+    """A name reduced for matching: no accents, punctuation or suffixes like Jr. / III."""
+    text = unicodedata.normalize("NFKD", name or "").encode("ascii", "ignore").decode()
+    words = re.sub(r"[.'\u2019\-]", "", text.lower()).split()
+    return " ".join(w for w in words if w not in ("jr", "sr", "ii", "iii", "iv", "v"))
+
+
+def _is_out(status):
+    s = (status or "").lower()
+    return (s == "out" or s.startswith("out ") or "injured reserve" in s or s == "ir"
+            or "suspen" in s or "reserve" in s or "unable to perform" in s)
+
+
+def _injury_report(sport):
+    """Every player on ESPN's injury report for the league: (list of dicts, Eastern time checked).
+    Kept for INJURY_REFRESH_MINUTES, then fetched again."""
+    cached = _injury_cache.get(sport)
+    if cached and time.time() - cached[0] < INJURY_REFRESH_MINUTES * 60:
+        return cached[1], cached[2]
+    path = _ESPN_PATH[sport]
+    by_id, by_name = {}, {}
+    try:
+        data = _get_json(f"https://site.api.espn.com/apis/site/v2/sports/{path}/teams")
+        for league in (data.get("sports") or [{}])[0].get("leagues", []):
+            for item in league.get("teams", []):
+                t = item.get("team", item)
+                by_id[str(t.get("id"))] = t.get("abbreviation")
+                by_name[t.get("displayName")] = t.get("abbreviation")
+    except Exception:
+        pass                                    # team codes then come from the report itself
+    data = _get_json(f"https://site.api.espn.com/apis/site/v2/sports/{path}/injuries")
+    mapping = _ESPN_TO_OURS[sport]
+    report = []
+    for block in data.get("injuries", []):
+        block_code = (block.get("abbreviation") or (block.get("team") or {}).get("abbreviation")
+                      or by_id.get(str(block.get("id"))) or by_name.get(block.get("displayName")))
+        for item in block.get("injuries", []):
+            athlete = item.get("athlete") or {}
+            code = (athlete.get("team") or {}).get("abbreviation") or block_code or ""
+            details = item.get("details") or {}
+            injury = " ".join(x for x in (details.get("side") if details.get("side") not in (None, "Not Specified") else None,
+                                          details.get("type"), details.get("detail")) if x)
+            status = item.get("status") or (item.get("type") or {}).get("description") or "Listed"
+            report.append({
+                "name": athlete.get("displayName") or athlete.get("fullName") or "",
+                "team": mapping.get(code, code),
+                "position": (athlete.get("position") or {}).get("abbreviation", ""),
+                "status": status,
+                "out": _is_out(status),
+                "injury": injury.lower(),
+                "return": (details.get("returnDate") or "")[:10],
+                "comment": item.get("shortComment") or item.get("longComment") or "",
+            })
+    checked = _eastern(datetime.datetime.now(datetime.timezone.utc))
+    _injury_cache[sport] = (time.time(), report, checked)
+    return report, checked
+
+
+def _injury_for(sport, name, team, report):
+    """The report entry for this player, or None. Name first; team breaks ties."""
+    key = _person(name)
+    matches = [r for r in report if _person(r["name"]) == key]
+    if len(matches) > 1:
+        matches = [r for r in matches if r["team"] == team] or matches[:1]
+    return matches[0] if matches else None
+
+
+def _status_text(entry):
+    text = entry["status"]
+    if entry["injury"]:
+        text += f" ({entry['injury']})"
+    return text
+
+
+def _apply_injuries(sport, found):
+    """Mark each prop with its player's injury status and drop players who are out.
+    Returns (kept props, [(name, team)] of dropped players, note about the check)."""
+    try:
+        report, checked = _injury_report(sport)
+    except Exception as e:
+        return found, [], f"{sport.upper()} injuries couldn't be checked ({e})"
+    kept, dropped = [], []
+    for c in found:
+        entry = _injury_for(sport, c["name"], c["team"], report)
+        if entry and entry["out"]:
+            if (c["name"], c["team"]) not in dropped:
+                dropped.append((c["name"], c["team"]))
+            continue
+        c["injury"] = _status_text(entry) if entry else ""
+        kept.append(c)
+    return kept, dropped, f"{sport.upper()} injuries checked {_clock(checked)}"
+
+
+def _injury_line(sport, name, team):
+    """A status line for the player tables ('' if he isn't on the report)."""
+    try:
+        report, _ = _injury_report(sport)
+    except Exception:
+        return "(injury report unavailable)"
+    entry = _injury_for(sport, name, team, report)
+    if not entry:
+        return ""
+    lines = [f"Status: {_status_text(entry)}"]
+    if entry["return"]:
+        lines.append(f"Est. return: {entry['return'][5:7].lstrip('0')}/{entry['return'][8:10].lstrip('0')}")
+    if entry["comment"]:
+        lines += textwrap.wrap(entry["comment"], max(30, _width() - 2))
+    return "\n".join(lines)
+
+
+def _injuries(sport, team):
+    try:
+        report, checked = _injury_report(sport)
+    except Exception as e:
+        print(f"Couldn't load the {sport.upper()} injury report ({e}).")
+        return
+    if team:
+        want = team.strip().upper()
+        report = [r for r in report if r["team"] == want]
+        if not report:
+            print(f"Nobody from {want} is on the {sport.upper()} injury report.")
+            print("(Use the team code from your files, e.g. nba_injuries('NY').)")
+            return
+    order = {True: 0, False: 1}
+    report = sorted(report, key=lambda r: (r["team"], order[r["out"]], r["status"], r["name"]))
+    print(f"{sport.upper()} injury report | checked {_clock(checked)}")
+    current = None
+    for r in report:
+        if r["team"] != current:
+            current = r["team"]
+            print(f"\n{current}")
+        print(f"  {r['name']} ({r['position']})" if r["position"] else f"  {r['name']}")
+        print(f"    {_status_text(r)}")
+        if r["return"]:
+            print(f"    Est. return: {r['return'][5:7].lstrip('0')}/{r['return'][8:10].lstrip('0')}")
+        if r["comment"] and team:
+            for line in textwrap.wrap(r["comment"], max(30, _width() - 4)):
+                print(f"    {line}")
+
+
+# Who counts as a regular for the injury summaries
+REGULAR_NBA_MINUTES = 15
+REGULAR_NHL_MINUTES = 12
+RECENT_TEAM_GAMES = 3
+_STATUS_ORDER = ["Out", "Doubtful", "Questionable", "Day-To-Day"]
+_roles_cache = {}
+
+
+def _roles(sport):
+    """{(name key, team): {"regular": bool, "recent": bool}} from this season's games.
+    recent = played in one of his team's last RECENT_TEAM_GAMES games."""
+    if sport in _roles_cache:
+        return _roles_cache[sport]
+    rows = _rows(sport, "player_games")
+    team_dates = {}
+    for r in rows:
+        team_dates.setdefault(r["team"], set()).add(r["game_date"])
+    cutoff = {t: sorted(d)[-RECENT_TEAM_GAMES] if len(d) >= RECENT_TEAM_GAMES else min(d)
+              for t, d in team_dates.items()}
+    players = {}
+    for r in rows:
+        players.setdefault(r["player_id"], []).append(r)
+    roles = {}
+    for games in players.values():
+        games.sort(key=lambda r: (r["game_date"], r["game_id"]))
+        latest = games[-1]
+        team = latest["team"]
+        if sport == "nba":
+            minutes = [_number(g.get("minutes")) or 0.0 for g in games]
+            regular = sum(minutes) / len(minutes) >= REGULAR_NBA_MINUTES
+        elif sport == "nhl":
+            minutes = [_number(g.get("toi")) or 0.0 for g in games]
+            regular = latest["position"] == "G" or sum(minutes) / len(minutes) >= REGULAR_NHL_MINUTES
+        else:
+            regular = True
+        roles[(_person(latest["player_name"]), team)] = {
+            "regular": regular, "recent": latest["game_date"] >= cutoff.get(team, "")}
+    _roles_cache[sport] = roles
+    return roles
+
+
+def _status_group(entry):
+    if entry["out"]:
+        return "Out"
+    for label in _STATUS_ORDER:
+        if entry["status"].lower() == label.lower():
+            return label
+    return entry["status"]
+
+
+def _injury_summary(sport, teams, report):
+    """A few lines naming each team's injured regulars, grouped by status."""
+    roles = _roles(sport)
+    lines = ["Injuries (regulars):"]
+    for team in teams:
+        groups = {}
+        for e in report:
+            if e["team"] != team:
+                continue
+            role = roles.get((_person(e["name"]), team))
+            if not role or not role["regular"]:
+                continue
+            if e["out"] and not role["recent"]:
+                continue                        # long-term absence: already in the recent stats
+            groups.setdefault(_status_group(e), []).append(_short_name(e["name"]))
+        order = sorted(groups, key=lambda g: (_STATUS_ORDER + [g]).index(g))
+        for n, group in enumerate(order):
+            first = f"  {team:<4} " if n == 0 else " " * 7
+            lines += textwrap.wrap(f"{group}: " + ", ".join(groups[group]), 38,
+                                   initial_indent=first, subsequent_indent=" " * 9)
+    if len(lines) == 1:
+        return ["Injuries: none among regulars"]
+    return lines
+
+
+def _injury_summary_or_note(sport, teams):
+    try:
+        report, _ = _injury_report(sport)
+        return _injury_summary(sport, teams, report)
+    except Exception:
+        return ["Injuries: report unavailable"]
+
+
+@_paged
+def nfl_injuries(team=None):
+    """The NFL injury report: nfl_injuries() for the league, nfl_injuries("BUF") for one team
+    (with ESPN's notes). Statuses: Out, Doubtful, Questionable, Injured Reserve ..."""
+    _injuries("nfl", team)
+
+
+@_paged
+def nba_injuries(team=None):
+    """The NBA injury report: nba_injuries() for the league, nba_injuries("NY") for one team."""
+    _injuries("nba", team)
+
+
+@_paged
+def nhl_injuries(team=None):
+    """The NHL injury report: nhl_injuries() for the league, nhl_injuries("NYR") for one team.
+    It doesn't say who starts in goal: that's confirmed close to game time."""
+    _injuries("nhl", team)
 
 
 # ---------------------------------------------------------------------------
@@ -957,13 +1333,15 @@ class _Matchups:
 # Today's props across every sport
 # ---------------------------------------------------------------------------
 
-def daily(games=10, min_hit=0.80, min_games=5, per_game=8, day=None):
+@_paged
+def daily(games=10, min_hit=0.80, min_games=5, per_game=8, day=None, log=10):
     """
     Consistent props for today's NFL, NBA and NHL games, in start-time order, grouped by game.
     Each game shows both teams' records; each prop shows his hit rate and how the opponent's
     defense (or, for goalies, offense) compares with the league.
     daily()                       last 10 games, 80%+ hit rate, up to 8 props per game
     daily(games=5), daily(games="season"), daily(min_hit=0.9), daily(per_game=20)
+    daily(log=20)                 list his last 20 games under each prop (log=0 hides the list)
     day=datetime.date(2026, 11, 22) for another day.
     """
     size, span = _window(games)
@@ -985,9 +1363,12 @@ def daily(games=10, min_hit=0.80, min_games=5, per_game=8, day=None):
         except Exception as e:
             notes.append(f"{sport.upper()}: couldn't build props ({e})")
             continue
+        found, dropped, injury_note = _apply_injuries(sport, found)
+        notes.append(injury_note)
         for g in todays:
             props = [c for c in found if c["team"] in (g["home"], g["away"])]
-            entries.append((g, sport, props[:per_game], len(props), records, matchups))
+            injuries = _injury_summary_or_note(sport, [g["away"], g["home"]])
+            entries.append((g, sport, props[:per_game], len(props), records, matchups, injuries))
 
     entries.sort(key=lambda e: (e[0]["start"] or datetime.datetime.max, e[1], e[0]["away"], e[0]["home"]))
     out = [f"Props for {day.strftime('%a')} {day.month}/{day.day}", f"{span} | {min_hit:.0%}+ hit rate"]
@@ -995,18 +1376,19 @@ def daily(games=10, min_hit=0.80, min_games=5, per_game=8, day=None):
     if not entries:
         out.append("No NFL, NBA or NHL games today." if not notes else "")
     goalie = False
-    for g, sport, props, total, records, matchups in entries:
+    for g, sport, props, total, records, matchups, injuries in entries:
         away, home = g["away"], g["home"]
         out += ["", "=" * 34,
                 f"{_clock(g['start'])} | {sport.upper()}",
                 f"{away} ({records.get(away, '0-0')}) @ {home} ({records.get(home, '0-0')})",
                 "=" * 34]
+        out += injuries
         if not props:
             out.append("  nothing clears the bar")
             continue
         for c in props:
             opponent = home if c["team"] == away else away
-            out += _prop_lines(c) + matchups.describe(c["position"], c["stat"], opponent)
+            out += _prop_lines(c) + matchups.describe(c["position"], c["stat"], opponent) + _log_lines(c, log)
             goalie = goalie or (sport == "nhl" and c["position"] == "G")
         if total > len(props):
             out.append(f"  (+{total - len(props)} more: use per_game={total})")
@@ -1016,12 +1398,21 @@ def daily(games=10, min_hit=0.80, min_games=5, per_game=8, day=None):
                 "offense: #1 shoots the most.",
                 "Verdicts are for the over: 5%+ above",
                 "average is favorable, 5%+ below tough."]
+        out += ["! marks a player on the injury",
+                "report. Out players are left off.",
+                "Injuries list regulars (NBA 15+ min,",
+                "NHL skaters 12+ min and goalies,",
+                "NFL players with stats): anyone",
+                "Doubtful, Questionable or Day-To-Day,",
+                "and Out players who played in one of",
+                "their team's last 3 games."]
         if goalie:
             out += ["Goalie lines use only games he",
                     "started: confirm he's starting."]
     print("\n".join(out))
 
 
+@_paged
 def daily_report():
     """Print the props report the GitHub job built this morning (fast: nothing to work out)."""
     _download.cache_clear()
