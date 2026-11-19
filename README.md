@@ -109,7 +109,9 @@ their game:
 - Games are in start-time order (Eastern). Games that start together are listed one after the
   other, each with its own props.
 - Each game shows the sport, the start time and both teams' records.
-- Each prop shows the line, his hit rate, average and lowest game, then the matchup:
+- Each prop shows the line, his hit rate, average and lowest game, the matchup (below), and
+  his last 10 games for that stat with the opponent, oldest first, `*` marking the games he
+  fell short of the line (`daily(log=20)` for 20, `log=0` to hide it):
   - **NBA:** what the opponent allows per game to his position (guards, forwards, centers)
   - **NHL skaters:** shots on goal the opponent allows per game
   - **NHL goalies:** shots on goal the opponent's offense takes per game
@@ -118,8 +120,28 @@ their game:
   - the opponent's rank and how far above or below league average it is, with a verdict for
     the over: **favorable** (5%+ above average), **tough** (5%+ below) or **neutral**
 
-Change `daily()` in the workflow (for example `daily(games=5)` or `daily(min_hit=0.9)`) to
+Change `daily(page=False)` in the workflow (for example `daily(page=False, games=5)`) to
 change the morning report; on the phone, `daily()` takes the same options.
+
+Each sport's report also checks ESPN's injury report: players listed as Out (including injured
+reserve and suspensions) are left off, and players who are Questionable, Doubtful or
+Day-To-Day are marked with `!` and their status. Under each game's header, a short summary
+lists both teams' injured regulars, grouped by status (team tables show the same summary):
+
+- regulars are NBA players averaging 15+ minutes, NHL skaters averaging 12+ minutes and all
+  goalies, and NFL players with stats this season;
+- anyone Doubtful, Questionable or Day-To-Day is listed;
+- Out players are listed only if they played in one of their team's last 3 games, since a
+  long absence is already reflected in the recent stats.
+
+The thresholds are `REGULAR_NBA_MINUTES`, `REGULAR_NHL_MINUTES` and `RECENT_TEAM_GAMES` in
+`sports_data.py`. The morning report
+checks injuries at 5-6am Eastern, so for anything close to game time run `daily()` on the phone,
+which checks them right then (the injury report is re-fetched after 10 minutes).
+
+On the phone, `daily_report()` and `daily()` show one game at a time (Return for the next game,
+`a` for the rest, `q` to quit). `daily_report(save=True)` saves the report to a text file in
+a-Shell's folder instead: open it from the Files app to scroll through it, or use Share → Notes.
 
 ## Things to know
 
