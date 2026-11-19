@@ -166,22 +166,55 @@ a-Shell's folder instead: open it from the Files app to scroll through it, or us
 Neither of these is built yet. Both would be new modules alongside `nfl.py`, `nba.py` and
 `nhl.py`, producing the same four files per season with the same leading columns.
 
-### NCAA men's football
+### NCAA men's football (revisit before the 2027 season, in August)
 
-- **Source:** ESPN's public JSON (`site.api.espn.com/apis/site/v2/sports/football/college-football`),
-  the same approach as `nba.py`: team schedules for the game list, one summary per game for
-  box scores, and ESPN's conference standings for the record check. No key needed.
-- **Optional cross-check:** CollegeFootballData.com. It has richer stats and betting lines,
-  but needs a free API key (kept as a GitHub secret) and the free tier is limited to about
-  1,000 calls a month. It returns a whole week of games per call, so a daily check could
-  still fit.
-- **Volume:** about 130 FBS teams and 50-60 FBS games on a typical Saturday.
-- **Decisions needed:** whether to include games against FCS teams (and FCS players' stats),
-  and whether bowl games and the playoff go in a separate file, as postseason games are
-  left out for the other sports.
-- **Checks:** records against ESPN's standings, final scores against the schedule, and
-  player passing, rushing and receiving yards against team totals.
-- **Timing:** the season runs late August to January.
+**Scope:** only games where at least one team is ranked in the Top 25 (AP, or the College
+Football Playoff rankings once they're released in November; make it a choice), and only
+**team bets**, no player props. Roughly 15-20 games a regular-season week.
+
+**Source:** ESPN's public college football JSON (`site.api.espn.com/apis/site/v2/sports/football/college-football`):
+
+- the scoreboard by week (`groups=80` for FBS) gives every score, each team's rank, the
+  neutral-site flag, quarter-by-quarter scores, and usually a spread and total from ESPN's
+  sportsbook partner; about 15 calls covers a season, and no box scores are needed;
+- the rankings feed has the AP, Coaches and CFP polls.
+
+**The key difference from the NFL: schedule strength.** A ranked team's history can mix
+63-7 against an FCS school with 17-14 against a top-10 rival, so raw hit rates mislead.
+Everything should be adjusted for opponents:
+
+- build simple **opponent-adjusted ratings** from final scores: an offense rating (points
+  scored) and a defense rating (points allowed) for every FBS team, corrected for schedule,
+  with FCS opponents pooled as one group;
+- in consistency checks, count **only games against FBS opponents**.
+
+**Bets, best fit first:**
+
+1. **Team totals (over and under).** Two lenses; the strongest signal is when they agree:
+   - consistency: the highest line cleared in 80%+ of games against FBS opponents;
+   - rating: expected points from his offense rating against this opponent's defense rating.
+2. **Game totals** (both teams), with the same two lenses; a cross-check on team totals.
+3. **Spreads**, as a sanity check: the rating's expected margin beside the posted spread
+   (e.g. "line ALA -7.5, model -11.2"), flagging big disagreements. Spreads on ranked games
+   are very efficient markets, so this isn't a pick generator.
+4. **First-half totals and spreads** (optional; quarter scores come free): useful in big
+   mismatches where starters sit in the second half.
+
+Skip moneylines on big favorites (prices too steep) and stat props like total yards or
+turnovers (rarely offered).
+
+**How it would fit in:**
+
+- `cfb.py` in the daily job: one row per team per game with scores, ranks at kickoff,
+  home / away / neutral, FBS or FCS opponent, and ESPN's spread and total; checks that every
+  final game has both teams and that scores match the scoreboard.
+- On the phone: `cfb_slate()` for the week's ranked games in kickoff order (both teams' ranks
+  and records, posted spread and total, the model's numbers, consistency team totals with a
+  scores log against FBS opponents, in the same layout as `daily()`), plus `cfb_team("ALA")`
+  and `cfb_rankings()`.
+- No home-field edge at neutral sites: conference championships, the playoff and most bowls.
+- Ratings are shakiest in the first few weeks; consider blending in the previous season's
+  final ratings early on.
 
 ### MLB
 
@@ -198,3 +231,29 @@ Neither of these is built yet. Both would be new modules alongside `nfl.py`, `nb
   and players' hits and runs against the team totals.
 - **Timing:** build in early March and test against spring training games before Opening
   Day in late March.
+
+**Props to focus on** (the ones that suit the consistency approach):
+
+1. **Pitcher strikeouts (the centerpiece).** Built from 20-25 batters faced, and strikeout
+   rate is among the most stable stats in baseball. Matchup: the opposing lineup's strikeout
+   rate, ideally against the pitcher's handedness.
+2. **Pitcher outs recorded and hits allowed.** Workhorse starters are consistent; the risk is
+   an early exit, so show recent pitch counts beside the log.
+3. **Team totals**, with both overs and unders (as the old NFL tool did for team points):
+   - team hits (steadiest; combined game hits steadier still)
+   - team strikeouts (the flip side of pitcher strikeouts; a useful cross-check)
+   - team walks (good stat, but check that the sportsbook offers it)
+   - team runs (weakest: best as unders, or as first-five-innings totals)
+
+Skip home runs, RBIs, stolen bases and single-stat hitter props: too rare or too random per
+game to be consistent.
+
+**Design notes:**
+
+- Pitcher windows should count starts (last 5-8), since starters pitch about every fifth day.
+- Matchups come from the opposing **starting pitcher** (strikeout, walk and hit rates, and
+  handedness against the lineup) plus the ballpark, rather than a team defense ranking.
+- Lineups are posted 2-3 hours before first pitch; the report should flag games whose
+  lineups aren't posted yet, much like confirming an NHL starting goalie.
+- 80%+ props are usually priced steeply (often -300 or worse), so the matchup filter, not the
+  hit rate alone, is where any edge comes from.
