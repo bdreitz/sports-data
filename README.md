@@ -42,14 +42,14 @@ If a button below is missing on the phone layout, tap **aA** in Safari's address
 choose **Request Desktop Website**.
 
 1. **Save the files** from the chat into the Files app: `common.py`, `nfl.py`, `nhl.py`,
-   `nba.py`, `update.py`, `update.yml`, `README.md` and `sports_data.py`.
+   `nba.py`, `update.py`, `update.yml`, `README.md`, `USAGE.md` and `sports_data.py`.
 2. **Create the repository.** On github.com, sign in (a free account is fine), tap **+** →
    **New repository**. Name it `sports-data`, choose **Public**, tick **Add a README file**,
    and tap **Create repository**. It must be public for the job to be free and for the
    phone to download the files without logging in.
 3. **Upload the Python files.** In the repository, tap **Add file** → **Upload files**, choose
-   `common.py`, `nfl.py`, `nhl.py`, `nba.py`, `update.py`, `sports_data.py` and `README.md`
-   (replacing the default README), then **Commit changes**. The job uses `sports_data.py` to
+   `common.py`, `nfl.py`, `nhl.py`, `nba.py`, `update.py`, `sports_data.py`, `USAGE.md` and
+   `README.md` (replacing the default README), then **Commit changes**. The job uses `sports_data.py` to
    build the daily props report.
 4. **Add the workflow.** Tap **Add file** → **Create new file**. For the name, type exactly
    `.github/workflows/update.yml` (the slashes create the folders). Open `update.yml` in
@@ -61,8 +61,9 @@ choose **Request Desktop Website**.
    tap **Releases** → **Stats data**: you should see twelve data files, four per sport, plus
    `daily_props.txt`. A red X means a sport
    failed its checks: tap the run, then **Fetch and check the data**, to read why.
-7. **Set up the phone script.** Copy `sports_data.py` into a-Shell, change the `REPO` line
-   near the top to `your-github-name/sports-data`, then run:
+7. **Set up the phone script.** Copy `sports_data.py` into a-Shell (its `REPO` line is set to
+   `bdreitz/sports-data`). `USAGE.md` explains every command, its options and what the output
+   looks like; in a-Shell, `usage()` (or `guide()`) shows the same. Then run:
 
    ```
    python3 -i sports_data.py
