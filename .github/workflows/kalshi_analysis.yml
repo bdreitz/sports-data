@@ -33,6 +33,7 @@ jobs:
           mkdir -p kalshi_state
           gh release download kalshi-nba --dir kalshi_state --pattern "kalshi_nba_markets.*"
           gh release download kalshi-nba --dir kalshi_state --pattern "kalshi_nba_checkpoints_*"
+          gh release download kalshi-nba --dir kalshi_state --pattern "kalshi_nba_windows_*"
 
       - name: Run the backtest (the report is printed here too)
         run: python kalshi_analysis.py --data kalshi_state --out analysis_out
