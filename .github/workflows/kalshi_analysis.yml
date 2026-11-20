@@ -1,0 +1,47 @@
+name: Kalshi NBA entry backtest
+
+on:
+  workflow_dispatch:            # run any time from the Actions tab
+  schedule:
+    - cron: "17 16 * * 1"       # Mondays, 11:17am-12:17pm Eastern, after the daily Kalshi update
+
+permissions:
+  contents: write               # needed to create and update the "kalshi-analysis" release
+
+concurrency:
+  group: kalshi-analysis
+  cancel-in-progress: false
+
+jobs:
+  analysis:
+    runs-on: ubuntu-latest      # the standard runner: free on public repositories
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pandas, numpy and pyarrow
+        run: pip install pandas numpy pyarrow
+
+      - name: Get the Kalshi data (contracts and checkpoints)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p kalshi_state
+          gh release download kalshi-nba --dir kalshi_state --pattern "kalshi_nba_markets.*"
+          gh release download kalshi-nba --dir kalshi_state --pattern "kalshi_nba_checkpoints_*"
+
+      - name: Run the backtest (the report is printed here too)
+        run: python kalshi_analysis.py --data kalshi_state --out analysis_out
+
+      - name: Publish to the "kalshi-analysis" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view kalshi-analysis >/dev/null 2>&1 || \
+            gh release create kalshi-analysis --title "Kalshi NBA entry backtest" \
+              --notes "analysis_report.txt (phone-width summary) and one CSV per study. Built by kalshi_analysis.py."
+          gh release upload kalshi-analysis analysis_out/* --clobber
