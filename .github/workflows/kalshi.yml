@@ -8,6 +8,10 @@ on:
         type: choice
         options: [probe, update, backfill]
         default: probe
+      since:
+        description: "first game date to include (blank = this season, from 2026-10-01; e.g. 2025-10-01 adds last season, which takes many runs)"
+        type: string
+        default: ""
   schedule:
     - cron: "37 14 * * *"       # daily update, 9:37-10:37am Eastern, after last night's markets settle
 
@@ -39,9 +43,12 @@ jobs:
         run: |
           mkdir -p kalshi_state
           gh release download kalshi-nba --dir kalshi_state || echo "Nothing published yet."
+          # Your NBA stats, for each contract's pre-game numbers (what the scanner showed then)
+          gh release download data --dir kalshi_state --pattern "nba_*_player_games.csv" --clobber \
+            || echo "NBA stats file not found: pre-game numbers will be skipped."
 
       - name: Run
-        run: python kalshi_nba.py --mode "${{ inputs.mode || 'update' }}" --state kalshi_state --out kalshi_out
+        run: python kalshi_nba.py --mode "${{ inputs.mode || 'update' }}" --since "${{ inputs.since }}" --state kalshi_state --out kalshi_out
 
       - name: Publish to the "kalshi-nba" release
         if: inputs.mode != 'probe'
