@@ -97,23 +97,36 @@ def load(folder):
                                                            if windows else pd.DataFrame())
 
 
-def load_minutes(folder):
-    """In-game one-minute candles from the kalshi_nba_minutes files, needed columns only."""
+def load_minutes(folder, notes=None):
+    """In-game one-minute candles from the kalshi_nba_minutes files, needed columns only.
+    Anything that goes wrong is added to `notes`, so the report can say why section 8 is empty."""
+    notes = notes if notes is not None else []
+    names = sorted(n for n in os.listdir(folder) if n.startswith("kalshi_nba_minutes_"))
+    if not names:
+        notes.append("no kalshi_nba_minutes files were found: check that the workflow downloads them")
     parts = []
-    for name in sorted(os.listdir(folder)):
-        if not name.startswith("kalshi_nba_minutes_"):
-            continue
+    for name in names:
         path = os.path.join(folder, name)
         try:
             if name.endswith(".parquet"):
-                df = pd.read_parquet(path, columns=MINUTE_COLUMNS)
+                import pyarrow.parquet as pq
+                available = set(pq.ParquetFile(path).schema.names)
+                df = pd.read_parquet(path, columns=[c for c in MINUTE_COLUMNS if c in available])
             else:
                 df = pd.read_csv(path, usecols=lambda c: c in MINUTE_COLUMNS)
         except Exception as e:
-            print(f"  couldn't read {name} ({e})")
+            notes.append(f"couldn't read {name}: {e}")
+            continue
+        missing = [c for c in ("market_ticker", "bid_close", "elapsed_s", "phase", "interval") if c not in df]
+        if missing:
+            notes.append(f"{name} is missing columns {missing}")
             continue
         parts.append(df[(df["interval"] == 1) & (df["phase"] == "live")])
-    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=MINUTE_COLUMNS)
+    frame = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=MINUTE_COLUMNS)
+    print(f"minute data: {len(names)} files, {len(frame)} in-game candles")
+    for n in notes:
+        print(f"  {n}")
+    return frame
 
 
 def prepare(markets, checkpoints):
@@ -433,7 +446,8 @@ def _pick(df, **conditions):
             if (part["period"] == p).any()}
 
 
-def report(info, baseline, pregame, minutes, strategies, state, lows=None, limits=None, selling=None):
+def report(info, baseline, pregame, minutes, strategies, state, lows=None, limits=None, selling=None,
+           sell_notes=None):
     out = ["Kalshi NBA props: entry backtest",
            f"{info['first_date']} to {info['last_date']}",
            f"profit per contract, cents, after fees", f"ranges: {CONFIDENCE:.0%} confidence"]
@@ -550,6 +564,13 @@ def report(info, baseline, pregame, minutes, strategies, state, lows=None, limit
                     lines.append(f"   {rng}d {_c(d.get('profit'), True)} c {_c(c.get('profit'), True)}")
         out += _section("7. FAVORITES: BUY ORDERS", lines)
 
+    if selling is None or selling.empty:
+        why = sell_notes or ["the selling study found no in-game prices"]
+        lines = ["Not available this run:"]
+        for note in why:
+            import textwrap
+            lines += textwrap.wrap(note, 36, initial_indent="  ", subsequent_indent="  ")
+        out += _section("8. SELLING EARLY", lines)
     if selling is not None and not selling.empty:
         intro = ["value = bid - fee - (1 if it won).",
                  "+ means selling then beat holding",
@@ -607,7 +628,12 @@ def main():
     markets, checkpoints, windows = load(args.data)
     cp, _, info = prepare(markets, checkpoints)
     lows, limits = study_favorites(cp, windows)
-    points = sell_points(load_minutes(args.data), info["clean_markets"], cp)
+    sell_notes = []
+    minute_data = load_minutes(args.data, sell_notes)
+    points = sell_points(minute_data, info["clean_markets"], cp)
+    if points.empty and len(minute_data) and not sell_notes:
+        sell_notes.append(f"{len(minute_data)} in-game candles were found, but none matched a clean "
+                          "contract with a score: check the play-by-play columns")
     selling = study_selling(points)
     results = {"baseline": study_baseline(cp), "pregame": study_pregame(cp),
                "minutes": study_minutes(cp), "strategies": study_strategies(cp),
@@ -617,7 +643,7 @@ def main():
     for name, df in results.items():
         df.to_csv(os.path.join(args.out, f"analysis_{name}.csv"), index=False)
     text = report(info, results["baseline"], results["pregame"], results["minutes"],
-                  results["strategies"], results["game_state"], lows, limits, selling)
+                  results["strategies"], results["game_state"], lows, limits, selling, sell_notes)
     with open(os.path.join(args.out, "analysis_report.txt"), "w", encoding="utf-8") as f:
         f.write(text)
     print(text)
