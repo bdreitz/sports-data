@@ -526,7 +526,10 @@ def contract_checkpoints(ticker, candles, state, pid, tip, day):
             t = start + (hour - GAME_DAY_START_HOUR_ET) * 3600
             if t < tip:
                 points.append((label, "pregame", t, None))
-    for label, minutes in (("tip_minus_60", 60), ("tip_minus_15", 15), ("tip", 0)):
+    # Spreads often widen in the last minute before tip-off, so a fair "right before the game"
+    # baseline may be a few minutes earlier: tip_minus_5 / tip_minus_2 make that comparison possible.
+    for label, minutes in (("tip_minus_60", 60), ("tip_minus_15", 15), ("tip_minus_5", 5),
+                           ("tip_minus_2", 2), ("tip", 0)):
         points.append((label, "pregame", tip - minutes * 60, None))
     if state is not None and state.tip_ts:
         for m in range(CHECKPOINT_EVERY_GAME_MIN, CHECKPOINT_THROUGH_GAME_MIN + 1, CHECKPOINT_EVERY_GAME_MIN):
