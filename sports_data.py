@@ -1817,6 +1817,25 @@ class _Matchups:
         totals, games = self.position_tables
         return {d: totals.get((d, group), {}).get(stat, 0.0) / n for d, n in games.items() if n}
 
+    def measure(self, position, stat, opponent):
+        """The matchup as numbers: {"value", "league", "rank", "teams", "change", "verdict",
+        "unit", "side"}, or None if there isn't enough data."""
+        how, column, unit, side, kind = _matchup_spec(self.sport, position, stat)
+        table = (self._team_table(column) if how == "team"
+                 else self._position_table(stat, _nba_group(position)))
+        if opponent not in table or not table:
+            return None
+        value = table[opponent]
+        league = sum(table.values()) / len(table)
+        if kind == "defense":            # 1 = allows the least (toughest)
+            rank = 1 + sum(1 for v in table.values() if v < value - 1e-9)
+        else:                            # 1 = shoots the most
+            rank = 1 + sum(1 for v in table.values() if v > value + 1e-9)
+        change = value / league - 1 if league else 0.0
+        verdict = "favorable" if change >= 0.05 else ("tough" if change <= -0.05 else "neutral")
+        return {"value": value, "league": league, "rank": rank, "teams": len(table),
+                "change": change, "verdict": verdict, "unit": unit, "side": side}
+
     def describe(self, position, stat, opponent):
         """Two lines judging the matchup for an over, or [] if there isn't enough data. Defense
         numbers are what the opponent allows per game; goalie matchups use the opponent's
@@ -1968,6 +1987,113 @@ def nhl_team_scan(games=10, min_hit=0.80, team=None, day=None, log=10, min_games
         for c in props:
             out += _team_prop_lines(c, matchups, log, span)
         print("\n".join(out))
+
+
+# ---------------------------------------------------------------------------
+# Daily record: what was flagged, and the injury report, saved each run for backtesting
+# ---------------------------------------------------------------------------
+
+_FLAGGED_COLUMNS = ["recorded_utc", "date", "sport", "start_et", "away", "home", "kind", "team",
+                    "opponent", "player", "position", "stat", "line", "hit_rate", "hits", "games",
+                    "avg", "low", "matchup_value", "matchup_league", "matchup_rank", "matchup_teams",
+                    "matchup_verdict", "injury_status", "listed"]
+_INJURY_COLUMNS = ["recorded_utc", "date", "sport", "team", "player", "position", "status", "out",
+                   "injury", "return_date", "comment"]
+
+
+def _append_csv(path_in, path_out, columns, rows):
+    """Copy the existing month file (if any) and add rows to it."""
+    existing = []
+    if path_in and os.path.exists(path_in):
+        with open(path_in, encoding="utf-8") as f:
+            existing = list(csv.DictReader(f))
+    with open(path_out, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(existing + rows)
+
+
+def save_daily_record(out_dir, state_dir=None, games=10, min_hit=0.80, min_games=5, day=None):
+    """
+    Save what today's report flags, and the injury report for today's teams, to monthly CSV
+    files (flagged_props_YYYY-MM.csv, injuries_YYYY-MM.csv) for backtesting. Each run adds its
+    rows with a timestamp, so runs through the day show how injury news changed.
+    Players listed as out are recorded too (listed = 0), since the report leaves them off.
+    """
+    size, _ = _window(games)
+    day = day or _today()
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    flagged, injuries = [], []
+    for sport in ("nfl", "nhl", "nba"):
+        try:
+            todays = _games_today(sport, day)
+        except Exception as e:
+            print(f"{sport}: schedule unavailable ({e})")
+            continue
+        if not todays:
+            continue
+        teams = {g["home"] for g in todays} | {g["away"] for g in todays}
+        game_of = {}
+        for g in todays:
+            game_of[g["home"]] = (g, g["away"])
+            game_of[g["away"]] = (g, g["home"])
+        try:
+            found = _candidates(sport, size, min_hit, min_games, teams)
+            matchups = _Matchups(sport)
+        except Exception as e:
+            print(f"{sport}: couldn't build props ({e})")
+            continue
+        try:
+            report, _ = _injury_report(sport)
+        except Exception as e:
+            print(f"{sport}: injury report unavailable ({e})")
+            report = []
+        for c in found:
+            g, opponent = game_of[c["team"]]
+            entry = _injury_for(sport, c["name"], c["team"], report) if report else None
+            m = matchups.measure(c["position"], c["stat"], opponent) or {}
+            flagged.append({
+                "recorded_utc": now, "date": day.isoformat(), "sport": sport,
+                "start_et": g["start"].strftime("%H:%M") if g["start"] else "", "away": g["away"],
+                "home": g["home"], "kind": "player", "team": c["team"], "opponent": opponent,
+                "player": c["name"], "position": c["position"], "stat": c["stat"], "line": c["line"],
+                "hit_rate": round(c["rate"], 4), "hits": c["hits"], "games": c["n"],
+                "avg": round(c["avg"], 3), "low": c["low"],
+                "matchup_value": round(m["value"], 3) if m else "", "matchup_league": round(m["league"], 3) if m else "",
+                "matchup_rank": m.get("rank", ""), "matchup_teams": m.get("teams", ""),
+                "matchup_verdict": m.get("verdict", ""),
+                "injury_status": _status_text(entry) if entry else "",
+                "listed": 0 if entry and entry["out"] else 1})
+        for g in todays:
+            try:
+                team_props = _team_props(sport, size, min_hit, min_games, g)
+            except Exception:
+                team_props = []
+            for c in team_props:
+                m = matchups.measure("TEAM", c["stat"], c["opponent"]) if c["kind"] == "team" else None
+                flagged.append({
+                    "recorded_utc": now, "date": day.isoformat(), "sport": sport,
+                    "start_et": g["start"].strftime("%H:%M") if g["start"] else "", "away": g["away"],
+                    "home": g["home"], "kind": c["kind"], "team": c["team"], "opponent": c.get("opponent", ""),
+                    "player": "", "position": "", "stat": c["stat"], "line": c["line"],
+                    "hit_rate": round(c["rate"], 4), "hits": c["hits"], "games": c["n"],
+                    "avg": round(c["avg"], 3), "low": c["low"],
+                    "matchup_value": round(m["value"], 3) if m else "", "matchup_league": round(m["league"], 3) if m else "",
+                    "matchup_rank": m.get("rank", "") if m else "", "matchup_teams": m.get("teams", "") if m else "",
+                    "matchup_verdict": m.get("verdict", "") if m else "", "injury_status": "", "listed": 1})
+        for e in report:
+            if e["team"] in teams:
+                injuries.append({"recorded_utc": now, "date": day.isoformat(), "sport": sport,
+                                 "team": e["team"], "player": e["name"], "position": e["position"],
+                                 "status": e["status"], "out": int(e["out"]), "injury": e["injury"],
+                                 "return_date": e["return"], "comment": e["comment"]})
+    os.makedirs(out_dir, exist_ok=True)
+    month = day.strftime("%Y-%m")
+    for stem, columns, rows in ((f"flagged_props_{month}.csv", _FLAGGED_COLUMNS, flagged),
+                                (f"injuries_{month}.csv", _INJURY_COLUMNS, injuries)):
+        _append_csv(os.path.join(state_dir, stem) if state_dir else None,
+                    os.path.join(out_dir, stem), columns, rows)
+    print(f"Recorded {len(flagged)} flagged props and {len(injuries)} injury entries for {day}.")
 
 
 # ---------------------------------------------------------------------------
