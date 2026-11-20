@@ -611,6 +611,13 @@ Sections (one per page):
      5/10/20c dip in Q1, Q2 or Q3
   5. Why it dipped: pace, foul trouble,
      score
+  6. 80% favorites (priced 75-85c 15
+     min before tip): how low the ask
+     went in Q1, the first half and
+     through Q3, for winners and losers
+  7. 80% favorites: resting buy orders
+     at 78/75/72/70/65c, how often they
+     fill, and profit per fill
 
 Each result shows the season, a
 discovery period (earlier games) and a
