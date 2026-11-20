@@ -28,8 +28,10 @@ from kalshi_nba import read_table  # noqa: E402
 # Settings
 # ---------------------------------------------------------------------------
 
-FEE_RATE = 0.07            # Kalshi taker fee per contract = FEE_RATE x price x (1 - price);
-                           # check it against Kalshi's current fee schedule
+FEE_RATE = 0.07            # Kalshi taker fee per contract = FEE_RATE x price x (1 - price): any order
+                           # that fills immediately, including a limit order at or past the ask
+MAKER_FEE_RATE = 0.0175    # resting limit orders that fill later (maker): a quarter of the taker rate
+                           # on series with maker fees, 0 on series without (kalshi.com/fee-schedule)
 BASELINE = "tip_minus_5"   # "buy right before the game" = the ask 5 minutes before tip-off
 DROPS = (0.05, 0.10, 0.20) # in-game dips tested: the ask this far below the baseline ask
 MAIN_DROP = 0.10           # the dip size shown in the detailed tables
@@ -64,6 +66,7 @@ SELL_BIDS = (0.30, 0.20, 0.10)             # "the bid falls to this"
 NEED_RATIOS = (1.5, 2.0, 3.0)              # "needs this many times his usual rate"
 COLLAPSE_FROM = 0.80                       # favorites priced at least this 15 min before tip...
 COLLAPSE_TO = (0.60, 0.50)                 # ...whose bid falls to this
+COLLAPSE_LEVELS = (0.40, 0.30, 0.20)       # section 10: deeper collapses, by bid and by ask
 MINUTE_COLUMNS = ["market_ticker", "ts", "interval", "bid_close", "ask_close", "volume", "phase",
                   "elapsed_s", "player_pts", "player_reb", "player_ast", "player_fouls", "margin"]
 PERIOD_NAMES = {"all": "Season", "discovery": "Discovery", "check": "Check"}
@@ -71,8 +74,8 @@ PERIOD_NAMES = {"all": "Season", "discovery": "Discovery", "check": "Check"}
 _rng = np.random.default_rng(7)
 
 
-def fee(price):
-    return FEE_RATE * price * (1 - price)
+def fee(price, maker=False):
+    return (MAKER_FEE_RATE if maker else FEE_RATE) * price * (1 - price)
 
 
 # ---------------------------------------------------------------------------
@@ -166,16 +169,16 @@ def prepare(markets, checkpoints):
 # Summaries
 # ---------------------------------------------------------------------------
 
-def summarize(df, price="ask", side="buy"):
+def summarize(df, price="ask", side="buy", maker=False):
     """n, units, average price, hit rate, edge (hit - price) and profit after fees, with a
     confidence range from resampling player-games. side="sell": the value of selling at that
     price instead of holding to the end, price - fee - result (+ = selling was better)."""
     if df.empty:
         return {"n": 0, "units": 0}
     if side == "sell":
-        profit = df[price] - fee(df[price]) - df["result"]
+        profit = df[price] - fee(df[price], maker) - df["result"]
     else:
-        profit = df["result"] - df[price] - fee(df[price])
+        profit = df["result"] - df[price] - fee(df[price], maker)
     out = {"n": len(df), "units": df["unit"].nunique(), "price": df[price].mean(),
            "hit": df["result"].mean(), "edge": df["result"].mean() - df[price].mean(),
            "profit": profit.mean()}
@@ -189,11 +192,11 @@ def summarize(df, price="ask", side="buy"):
     return out
 
 
-def by_periods(df, price="ask", side="buy"):
+def by_periods(df, price="ask", side="buy", maker=False):
     """The summary for the whole season, the discovery period and the check period."""
-    return {"all": summarize(df, price, side),
-            "discovery": summarize(df[df["period_split"] == "discovery"], price, side),
-            "check": summarize(df[df["period_split"] == "check"], price, side)}
+    return {"all": summarize(df, price, side, maker),
+            "discovery": summarize(df[df["period_split"] == "discovery"], price, side, maker),
+            "check": summarize(df[df["period_split"] == "check"], price, side, maker)}
 
 
 def rows_of(label, periods, **extra):
@@ -342,7 +345,7 @@ def study_favorites(cp, windows):
             for offset in LIMIT_OFFSETS:
                 df["limit"] = df["entry_ask"] - offset
                 filled = df[df["low"] <= df["limit"] + 1e-9]
-                summary = by_periods(filled, price="limit") if len(filled) else {
+                summary = by_periods(filled, price="limit", maker=True) if len(filled) else {
                     "all": {"n": 0}, "discovery": {"n": 0}, "check": {"n": 0}}
                 limit_rows += rows_of(f"-{int(offset * 100)}c", summary, group=name, window=wname,
                                       offset=offset, fill_rate=len(filled) / len(df), bets=len(df))
@@ -415,6 +418,39 @@ def study_selling(points):
     return pd.DataFrame(rows)
 
 
+def study_collapse(points):
+    """Favorites priced COLLAPSE_FROM+ before tip, at the first moment in each quarter that the
+    bid ("shows") or the ask ("buyable") fell to each COLLAPSE_LEVELS price: the bid, ask, mid
+    and spread then, how often they won, and profit buying at the ask vs at the bid."""
+    if points.empty or "ask_close" not in points:
+        return pd.DataFrame()
+    fav = points[points["pregame_ask"] >= COLLAPSE_FROM - 1e-9]
+    rows = []
+    for trigger, column in (("shows", "bid"), ("buyable", "ask_close")):
+        for level in COLLAPSE_LEVELS:
+            for window in SELL_WINDOWS:
+                for liquid in (False, True):
+                    hit = _first_sale(fav, window, fav[column] <= level + 1e-9, liquid)
+                    hit = hit[hit["ask_close"].notna() & hit["bid"].notna()]
+                    row = {"trigger": trigger, "level": level, "window": window,
+                           "subset": "liquid" if liquid else "all", "n": len(hit)}
+                    if len(hit):
+                        at_ask = by_periods(hit, price="ask_close")
+                        at_bid = summarize(hit, price="bid", maker=True)
+                        row.update({"bid": hit["bid"].mean(), "ask": hit["ask_close"].mean(),
+                                    "mid": ((hit["bid"] + hit["ask_close"]) / 2).mean(),
+                                    "spread": (hit["ask_close"] - hit["bid"]).mean(),
+                                    "won": hit["result"].mean(),
+                                    "buy_at_ask": at_ask["all"].get("profit"),
+                                    "buy_at_ask_low": at_ask["all"].get("low"),
+                                    "buy_at_ask_high": at_ask["all"].get("high"),
+                                    "buy_at_ask_discovery": at_ask["discovery"].get("profit"),
+                                    "buy_at_ask_check": at_ask["check"].get("profit"),
+                                    "buy_at_bid": at_bid.get("profit")})
+                    rows.append(row)
+    return pd.DataFrame(rows)
+
+
 # ---------------------------------------------------------------------------
 # Report (40 characters wide, one section per page)
 # ---------------------------------------------------------------------------
@@ -447,7 +483,7 @@ def _pick(df, **conditions):
 
 
 def report(info, baseline, pregame, minutes, strategies, state, lows=None, limits=None, selling=None,
-           sell_notes=None):
+           sell_notes=None, collapse=None):
     out = ["Kalshi NBA props: entry backtest",
            f"{info['first_date']} to {info['last_date']}",
            f"profit per contract, cents, after fees", f"ranges: {CONFIDENCE:.0%} confidence"]
@@ -461,7 +497,8 @@ def report(info, baseline, pregame, minutes, strategies, state, lows=None, limit
         f"discovery: games through {info['split']}",
         "check: games after that",
         f"baseline: ask at {BASELINE.replace('_', ' ')}",
-        f"fee: {FEE_RATE:.0%} x p x (1-p)"])
+        f"fee: {FEE_RATE:.0%} x p x (1-p) (taker),",
+        f"  {MAKER_FEE_RATE * 100:g}% for resting orders (maker)"])
 
     lines = []
     for subset in ("all", "flagged"):
@@ -544,7 +581,7 @@ def report(info, baseline, pregame, minutes, strategies, state, lows=None, limit
         lines = ["Buy order X cents below the price",
                  "15 min before tip, left open through",
                  "the window (filled if the ask",
-                 "touched it). Profit per fill:"]
+                 "touched it). Maker fee. Per fill:"]
         for name in dict.fromkeys(limits["group"]):
             g = limits[limits["group"] == name]
             lines += ["", f"{name}:"]
@@ -604,6 +641,46 @@ def report(info, baseline, pregame, minutes, strategies, state, lows=None, limit
             "left. foul trouble: 2+ fouls in Q1,",
             "3+ in Q2, 4+ in Q3, 5+ in Q4.", ""] + rule_lines(["needs", "state"]))
 
+    if collapse is not None and not collapse.empty:
+        for trigger, title, intro in (
+                ("shows", "10. COLLAPSED FAVORITES: BID",
+                 ["80c+ favorites (15 min before tip)",
+                  "the first time in the quarter the",
+                  "BID fell to the level (roughly what",
+                  "the app shows). Cents. won = how",
+                  "often they still won. buy@ask = what",
+                  "you'd really pay. buy@bid = a resting",
+                  "order filled at the bid, maker fee",
+                  "(best case)."]),
+                ("buyable", "11. COLLAPSED FAVORITES: ASK",
+                 ["80c+ favorites, the first time in",
+                  "the quarter the ASK fell to the",
+                  "level: you could actually buy there.",
+                  "Is a favorite you can buy at 20c",
+                  "really more than 20% likely?"])):
+            lines = list(intro)
+            part = collapse[collapse["trigger"] == trigger]
+            for level in COLLAPSE_LEVELS:
+                lines += ["", f"{'bid' if trigger == 'shows' else 'ask'} fell to {int(level * 100)}c or less:"]
+                for window in SELL_WINDOWS:
+                    rows = part[(part["level"] == level) & (part["window"] == window)].set_index("subset")
+                    if "all" not in rows.index or not rows.loc["all", "n"]:
+                        lines.append(f" {window}: none")
+                        continue
+                    r = rows.loc["all"]
+                    lines.append(f" {window} n {int(r['n'])}: bid {_c(r['bid'])} ask {_c(r['ask'])} "
+                                 f"sprd {_c(r['spread'])}")
+                    lines.append(f"  won {r['won'] * 100:.0f}%  buy@ask {_c(r['buy_at_ask'], True)}"
+                                 f"  @bid {_c(r['buy_at_bid'], True)}")
+                    if pd.notna(r.get("buy_at_ask_low")):
+                        lines.append(f"  @ask ({_c(r['buy_at_ask_low'], True)},{_c(r['buy_at_ask_high'], True)})"
+                                     f" d {_c(r['buy_at_ask_discovery'], True)} c {_c(r['buy_at_ask_check'], True)}")
+                    if "liquid" in rows.index and rows.loc["liquid", "n"]:
+                        q = rows.loc["liquid"]
+                        lines.append(f"  liquid n {int(q['n'])} won {q['won'] * 100:.0f}%"
+                                     f" @ask {_c(q['buy_at_ask'], True)}")
+            out += _section(title, lines)
+
     out += _section("HOW TO READ THIS", [
         "profit: average result per contract",
         "  bought at the ask, minus price and",
@@ -635,15 +712,17 @@ def main():
         sell_notes.append(f"{len(minute_data)} in-game candles were found, but none matched a clean "
                           "contract with a score: check the play-by-play columns")
     selling = study_selling(points)
+    collapse = study_collapse(points)
     results = {"baseline": study_baseline(cp), "pregame": study_pregame(cp),
                "minutes": study_minutes(cp), "strategies": study_strategies(cp),
                "game_state": study_game_state(cp), "favorite_lows": lows, "favorite_limits": limits,
-               "selling": selling}
+               "selling": selling, "collapse": collapse}
     os.makedirs(args.out, exist_ok=True)
     for name, df in results.items():
         df.to_csv(os.path.join(args.out, f"analysis_{name}.csv"), index=False)
     text = report(info, results["baseline"], results["pregame"], results["minutes"],
-                  results["strategies"], results["game_state"], lows, limits, selling, sell_notes)
+                  results["strategies"], results["game_state"], lows, limits, selling, sell_notes,
+                  collapse)
     with open(os.path.join(args.out, "analysis_report.txt"), "w", encoding="utf-8") as f:
         f.write(text)
     print(text)
