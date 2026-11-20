@@ -9,6 +9,8 @@ on:
     - cron: "23 10 * * *"       # 10:23 UTC (5:23-6:23am Eastern), after late games are final
     - cron: "47 11 * * *"       # backup
     - cron: "17 13 * * *"       # backup (8:17-9:17am Eastern)
+    - cron: "47 21 * * *"       # late afternoon (4:47-5:47pm Eastern): fresher injury news for the
+                                # report and the daily record, closer to tip-off
   workflow_dispatch:            # adds a "Run workflow" button on the Actions tab
     inputs:
       full_rebuild:
@@ -52,6 +54,28 @@ jobs:
           python -c "import sports_data; sports_data.daily(page=False)" > daily_props.txt
           cat daily_props.txt
           mv daily_props.txt out/daily_props.txt
+
+      # Saves what the report flags and the injury report for today's teams, adding to monthly
+      # CSV files on the "history" release (flagged_props_YYYY-MM.csv, injuries_YYYY-MM.csv),
+      # for backtesting. Each run adds a timestamped snapshot.
+      - name: Save today's flagged props and injury reports
+        if: always()
+        continue-on-error: true
+        env:
+          SPORTS_DATA_LOCAL: out
+          SPORTS_DATA_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p history_in history_out
+          gh release download history --dir history_in --pattern "*.csv" || echo "No history yet."
+          python -c "import sports_data; sports_data.save_daily_record('history_out', 'history_in')"
+          gh release view history >/dev/null 2>&1 || \
+            gh release create history --title "Daily history" --notes "Flagged props and injury reports, saved by each Update stats run."
+          shopt -s nullglob
+          files=(history_out/*)
+          if [ ${#files[@]} -gt 0 ]; then
+            gh release upload history "${files[@]}" --clobber
+          fi
 
       # Runs even if a sport failed its checks: that sport only has its status file in out/,
       # so its previously published data stays untouched, while a sport that passed is updated.
