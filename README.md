@@ -244,9 +244,10 @@ adds them, but archived games are fetched one contract at a time, so that takes 
 (`.github/workflows/kalshi_analysis.yml`, Mondays or on demand) test when to buy: buying at the
 ask 5 minutes before tip-off (the baseline) vs earlier in the day, at each game minute, or after
 an in-game price dip, with the dip broken down by pace, foul trouble and score. It also looks
-at favorites priced 75-85c 15 minutes before tip-off: how low the ask went in Q1, the first half
-and through Q3 (winners and losers separately), and how resting buy orders at 78/75/72/70/65c
-would have done. Results are
+at favorites by their price 15 minutes before tip-off (75-85c scanner-flagged; 85-92c with a
+last-10 hit rate of 90%+, of 100%, and everything): how far below that price the ask went in Q1,
+the first half and through Q3 (winners and losers separately), and how buy orders 3, 5, 8, 10
+and 15c below it would have done. The groups are `FAVORITE_GROUPS` in `kalshi_analysis.py`. Results are
 profit per contract after Kalshi's fee, with uncertainty ranges that treat a player's contracts
 in the same game as one unit, for the whole season, a discovery period (the first 70% of game
 dates) and a check period (the rest). Scanner-flagged contracts and liquid entries are reported
