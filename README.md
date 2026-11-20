@@ -1,48 +1,47 @@
 # sports-data
-
+ 
 A daily GitHub Actions job that builds NFL, NBA and NHL game-by-game stats files in one
 consistent format and publishes them on this repository's **data** release, where the phone
 tools download them.
-
+ 
 - **NFL** comes from nflverse's published files, reshaped to the shared format. Records are
   cross-checked against ESPN's standings.
 - **NHL** comes from the official NHL API (api-web.nhle.com).
 - **NBA** comes from ESPN's public JSON (site.api.espn.com).
-
 After updating the data, the job also writes **`daily_props.txt`**: consistent player props for
 that day's games in every sport, in start-time order, with both teams' records and how each
 player's opponent compares with the league. `daily_report()` in `sports_data.py` prints it.
-
+ 
 Each sport publishes four files (NHL 2026-27 shown):
-
+ 
 | File | What's in it |
 |---|---|
 | `nhl_2026-27_player_games.csv` | one row per player per game (goalies who played included) |
 | `nhl_2026-27_team_games.csv` | one row per team per game, with the opponent's numbers |
 | `nhl_2026-27_status.json` | when it last updated and whether every check passed |
 | `nhl_2026-27_changelog.txt` | games added and stat corrections, newest first |
-
+ 
 The NBA files have the same names starting with `nba_`, and the NFL files are named by the
 season's starting year, like `nfl_2026_player_games.csv`.
-
+ 
 Every file starts with the same columns: `season`, `game_id`, `game_date`, `team`,
 `opponent`, `home` (1 or 0), and for players `player_id`, `player_name` and `position`.
 NFL files also have `week`. After those come each sport's stats:
-
+ 
 - **NFL** keeps nflverse's own column names (`passing_yards`, `carries`, `receptions`,
   `fg_made`, `fantasy_points_ppr` ...), so code written for nflverse's files reads them too.
   Team rows add `result` (W/L/T), `points_for`, `points_against` and the opponent's main
   numbers (`opp_passing_yards` ...).
 - **NBA** team rows also have possessions, pace and offensive/defensive rating (points per
   100 possessions).
-
 ## Setup (about 15 minutes, all from Safari on iPhone)
-
+ 
 If a button below is missing on the phone layout, tap **aA** in Safari's address bar and
 choose **Request Desktop Website**.
-
+ 
 1. **Save the files** from the chat into the Files app: `common.py`, `nfl.py`, `nhl.py`,
-   `nba.py`, `update.py`, `update.yml`, `README.md`, `USAGE.md` and `sports_data.py`.
+   `nba.py`, `update.py`, `update.yml`, `README.md`, `USAGE.md` and `sports_data.py`
+   (and, for the Kalshi backtesting data, `kalshi_nba.py` and `kalshi.yml`).
 2. **Create the repository.** On github.com, sign in (a free account is fine), tap **+** →
    **New repository**. Name it `sports-data`, choose **Public**, tick **Add a README file**,
    and tap **Create repository**. It must be public for the job to be free and for the
@@ -64,21 +63,21 @@ choose **Request Desktop Website**.
 7. **Set up the phone script.** Copy `sports_data.py` into a-Shell (its `REPO` line is set to
    `bdreitz/sports-data`). `USAGE.md` explains every command, its options and what the output
    looks like; in a-Shell, `usage()` (or `guide()`) shows the same. Then run:
-
-   ```
-   python3 -i sports_data.py
-   >>> status()
-   >>> daily_report()
-   >>> nfl("josh allen")
-   >>> nhl("mcdavid")
-   >>> nba_team("NY")
-   ```
-
+```
+python3 -i sports_data.py
+>>> status()
+>>> daily_report()
+>>> nfl("josh allen")
+>>> nhl("mcdavid")
+>>> nba_team("NY")
+```
+ 
 ## What happens each day
-
+ 
 The job runs at 10:23 UTC (5-6am Eastern), with backup runs at 11:47 and 13:17 UTC, because
-GitHub can delay or drop scheduled runs. Extra runs are harmless. For each sport it:
-
+GitHub can delay or drop scheduled runs, and again at 21:47 UTC (late afternoon Eastern) for
+fresher injury news. Extra runs are harmless. For each sport it:
+ 
 1. Downloads the files it published last time.
 2. Fetches the standings and schedule, and box scores for new final games, **plus every
    game from the last 7 days** to pick up stat corrections. Every Monday it re-fetches the
@@ -96,18 +95,21 @@ GitHub can delay or drop scheduled runs. Extra runs are harmless. For each sport
 5. Publishes only if every check passes. Otherwise the previous files stay as they were,
    the status file says what failed, and the run shows a red X. GitHub emails you about
    failed runs by default.
-
 Then it builds `daily_props.txt` for that day's games (if there are any) and publishes it with
-the data. If building the report fails, the data is still published and yesterday's report stays.
-
+the data, and saves a **daily record** for backtesting on the **history** release:
+`flagged_props_YYYY-MM.csv` (every prop the report flags, with its line, hit rate, average,
+matchup numbers and injury status, plus flagged players who were out) and
+`injuries_YYYY-MM.csv` (the injury report for that day's teams). Each run adds a timestamped
+snapshot, so the four daily runs show how injury news changed through the day. If building the report fails, the data is still published and yesterday's report stays.
+ 
 To force a full re-fetch, use **Run workflow** and tick **Re-fetch every game this season**.
-
+ 
 ## The daily props report
-
+ 
 For each sport with games that day, `daily()` finds every player on those teams with a line he
 reached in at least 80% of his last 10 games (the scanner's settings), then lists them under
 their game:
-
+ 
 - Games are in start-time order (Eastern). Games that start together are listed one after the
   other, each with its own props.
 - Each game shows the sport, the start time and both teams' records.
@@ -121,32 +123,30 @@ their game:
     allowed for TD props); **RBs:** the run defense (rush yards allowed)
   - the opponent's rank and how far above or below league average it is, with a verdict for
     the over: **favorable** (5%+ above average), **tough** (5%+ below) or **neutral**
-
 Change `daily(page=False)` in the workflow (for example `daily(page=False, games=5)`) to
 change the morning report; on the phone, `daily()` takes the same options.
-
+ 
 Each sport's report also checks ESPN's injury report: players listed as Out (including injured
 reserve and suspensions) are left off, and players who are Questionable, Doubtful or
 Day-To-Day are marked with `!` and their status. Under each game's header, a short summary
 lists both teams' injured regulars, grouped by status (team tables show the same summary):
-
+ 
 - regulars are NBA players averaging 15+ minutes, NHL skaters averaging 12+ minutes and all
   goalies, and NFL players with stats this season;
 - anyone Doubtful, Questionable or Day-To-Day is listed;
 - Out players are listed only if they played in one of their team's last 3 games, since a
   long absence is already reflected in the recent stats.
-
 The thresholds are `REGULAR_NBA_MINUTES`, `REGULAR_NHL_MINUTES` and `RECENT_TEAM_GAMES` in
 `sports_data.py`. The morning report
 checks injuries at 5-6am Eastern, so for anything close to game time run `daily()` on the phone,
 which checks them right then (the injury report is re-fetched after 10 minutes).
-
+ 
 On the phone, `daily_report()` and `daily()` show one game at a time (Return for the next game,
 `a` for the rest, `q` to quit). `daily_report(save=True)` saves the report to a text file in
 a-Shell's folder instead: open it from the Files app to scroll through it, or use Share → Notes.
-
+ 
 ## Things to know
-
+ 
 - **The data is only as accurate as the source.** The checks guarantee the files match
   what the NHL and ESPN report. If the source is wrong, the files will be too.
 - **NFL updates can trail by a day.** If a game has a final score on the schedule but
@@ -162,36 +162,98 @@ a-Shell's folder instead: open it from the Files app to scroll through it, or us
   open the Actions tab and re-enable the workflow.
 - **Both APIs are undocumented.** If one changes, the checks will most likely catch it and
   stop publishing rather than publish wrong data. The run log shows the details.
-
+## Kalshi NBA props history (backtesting)
+ 
+`kalshi_nba.py` and the **Kalshi NBA props history** workflow (`.github/workflows/kalshi.yml`)
+build a dataset for testing in-game betting ideas on Kalshi's NBA player props (points,
+rebounds, assists). For every settled game it collects:
+ 
+- **Kalshi prices:** hourly candles from 8am Eastern on game day, then one-minute candles from
+  an hour before tip-off to the end of the game: bid and ask (open, low, high, close), last
+  trade, volume and open interest. Recent games come from Kalshi's live API; older ones from
+  its historical archive.
+- **Game state at every candle:** ESPN play-by-play rebuilt into each player's running points,
+  rebounds, assists and fouls, plus the score, period and clock. The rebuilt totals are checked
+  against ESPN's final box score, and players that don't match are flagged.
+It publishes to its own release, **kalshi-nba** (Parquet files, for analysis in Python, not
+a-Shell):
+ 
+| File | What's in it |
+|---|---|
+| `kalshi_nba_markets.parquet` | one row per contract: player, threshold, result (1/0), final stat, prices at tip-off, flags, and his **pre-game numbers** (below) |
+| `kalshi_nba_minutes_YYYY-MM.parquet` | one row per contract per candle, with the game state at that time |
+| `kalshi_nba_checkpoints_YYYY-MM.parquet` | one row per contract per checkpoint: the bid and ask then (carried forward from the last candle), minutes since that quote, volume in the last 5 minutes, and the game state |
+| `kalshi_nba_windows_YYYY-MM.parquet` | one row per contract per window: the lowest ask (and the lowest intra-minute ask), when it happened, volume around it, and the game state then |
+ 
+**Checkpoints:** the first quote, 10am, noon and 3pm Eastern, 60 and 15 minutes before tip-off,
+tip-off (the baseline: entering right before the game), then every 2 minutes of **game clock**
+through the third quarter (2:00, 4:00 ... 36:00 of game time), placed at the real moment the game clock
+reached them, so timeouts and reviews don't shift them. `CHECKPOINT_EVERY_GAME_MIN` and
+`CHECKPOINT_THROUGH_GAME_MIN` in `kalshi_nba.py` change them.
+ 
+**Windows:** the whole pregame day, the last hour before tip-off, and the first 6 minutes,
+first quarter, first half, and first three quarters of game clock.
+ 
+**Game state** at every row: phase, period, clock, game time elapsed, score, the player's team
+score margin, and his running points, rebounds, assists and fouls.
+ 
+**Pre-game numbers** (`pre_*` columns), from your NBA stats using only games before that day:
+games played, last-5 / last-10 / season averages, how often he reached the contract's threshold
+(last 10 and season), his 80% line, whether the scanner would have flagged that threshold,
+days of rest, and the opponent's matchup then (allowed per game to his position group, league
+average, rank and verdict).
+ 
+| `nba_pbp_YYYY-MM.jsonl.gz` | every game's play-by-play (each play's time, game clock, type, text, players, points and score) and box score, one JSON line per game |
+ 
+The play-by-play archive is kept for building **player profiles** later (fast starters, strong
+first halves, strong finishers, streaky players): it covers every player in every game, every
+shot attempt, and the order of events, so profiles can be built without fetching games again.
+One limit: ESPN often doesn't log substitutions between quarters, so minutes played by quarter
+can only be estimated.
+ 
+**Flags** mark rows to treat with care: `price_settlement` (the player never played, so the
+contract settled at a price, not $1 or $0), `pbp_mismatch`, `player_unmatched`,
+`game_unmatched`, `no_play_by_play`, `no_candles`.
+ 
+**Running it** (Actions tab → **Kalshi NBA props history** → **Run workflow**):
+ 
+- **probe** (the default): checks the newest game for each stat end to end and prints what it
+  found. Publishes nothing. Run this first.
+- **backfill:** builds the whole season (October 2026 on). Takes a while; if it stops at its
+  per-run limit, run **update** to continue.
+- **update:** adds settled games not yet stored. Also runs daily at 14:37 UTC.
+The **since** box sets the first game date (blank = this season, from 2026-10-01). Kalshi also
+has last season's props in its archive (about 1,000 games per stat); `since` = `2025-10-01`
+adds them, but archived games are fetched one contract at a time, so that takes many runs
+(each run stops at its limit and the next continues).
+ 
 ## Future work
-
+ 
 Neither of these is built yet. Both would be new modules alongside `nfl.py`, `nba.py` and
 `nhl.py`, producing the same four files per season with the same leading columns.
-
+ 
 ### NCAA men's football (revisit before the 2027 season, in August)
-
+ 
 **Scope:** only games where at least one team is ranked in the Top 25 (AP, or the College
 Football Playoff rankings once they're released in November; make it a choice), and only
 **team bets**, no player props. Roughly 15-20 games a regular-season week.
-
+ 
 **Source:** ESPN's public college football JSON (`site.api.espn.com/apis/site/v2/sports/football/college-football`):
-
+ 
 - the scoreboard by week (`groups=80` for FBS) gives every score, each team's rank, the
   neutral-site flag, quarter-by-quarter scores, and usually a spread and total from ESPN's
   sportsbook partner; about 15 calls covers a season, and no box scores are needed;
 - the rankings feed has the AP, Coaches and CFP polls.
-
 **The key difference from the NFL: schedule strength.** A ranked team's history can mix
 63-7 against an FCS school with 17-14 against a top-10 rival, so raw hit rates mislead.
 Everything should be adjusted for opponents:
-
+ 
 - build simple **opponent-adjusted ratings** from final scores: an offense rating (points
   scored) and a defense rating (points allowed) for every FBS team, corrected for schedule,
   with FCS opponents pooled as one group;
 - in consistency checks, count **only games against FBS opponents**.
-
 **Bets, best fit first:**
-
+ 
 1. **Team totals (over and under).** Two lenses; the strongest signal is when they agree:
    - consistency: the highest line cleared in 80%+ of games against FBS opponents;
    - rating: expected points from his offense rating against this opponent's defense rating.
@@ -201,12 +263,11 @@ Everything should be adjusted for opponents:
    are very efficient markets, so this isn't a pick generator.
 4. **First-half totals and spreads** (optional; quarter scores come free): useful in big
    mismatches where starters sit in the second half.
-
 Skip moneylines on big favorites (prices too steep) and stat props like total yards or
 turnovers (rarely offered).
-
+ 
 **How it would fit in:**
-
+ 
 - `cfb.py` in the daily job: one row per team per game with scores, ranks at kickoff,
   home / away / neutral, FBS or FCS opponent, and ESPN's spread and total; checks that every
   final game has both teams and that scores match the scoreboard.
@@ -217,9 +278,8 @@ turnovers (rarely offered).
 - No home-field edge at neutral sites: conference championships, the playoff and most bowls.
 - Ratings are shakiest in the first few weeks; consider blending in the previous season's
   final ratings early on.
-
 ### MLB
-
+ 
 - **Source:** the official MLB Stats API (`statsapi.mlb.com`), public with no key, and the
   closest match to the NHL API: schedule (regular season only), one box score per game,
   and official standings. It's intended for personal, non-commercial use.
@@ -233,9 +293,8 @@ turnovers (rarely offered).
   and players' hits and runs against the team totals.
 - **Timing:** build in early March and test against spring training games before Opening
   Day in late March.
-
 **Props to focus on** (the ones that suit the consistency approach):
-
+ 
 1. **Pitcher strikeouts (the centerpiece).** Built from 20-25 batters faced, and strikeout
    rate is among the most stable stats in baseball. Matchup: the opposing lineup's strikeout
    rate, ideally against the pitcher's handedness.
@@ -246,12 +305,11 @@ turnovers (rarely offered).
    - team strikeouts (the flip side of pitcher strikeouts; a useful cross-check)
    - team walks (good stat, but check that the sportsbook offers it)
    - team runs (weakest: best as unders, or as first-five-innings totals)
-
 Skip home runs, RBIs, stolen bases and single-stat hitter props: too rare or too random per
 game to be consistent.
-
+ 
 **Design notes:**
-
+ 
 - Pitcher windows should count starts (last 5-8), since starters pitch about every fifth day.
 - Matchups come from the opposing **starting pitcher** (strikeout, walk and hit rates, and
   handedness against the lineup) plus the ballpark, rather than a team defense ranking.
@@ -259,3 +317,4 @@ game to be consistent.
   lineups aren't posted yet, much like confirming an NHL starting goalie.
 - 80%+ props are usually priced steeply (often -300 or worse), so the matchup filter, not the
   hit rate alone, is where any edge comes from.
+ 
