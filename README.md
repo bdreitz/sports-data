@@ -76,7 +76,8 @@ choose **Request Desktop Website**.
 
 ## What happens each day
 
-The job runs at 10:00 UTC (5-6am Eastern). For each sport it:
+The job runs at 10:23 UTC (5-6am Eastern), with backup runs at 11:47 and 13:17 UTC, because
+GitHub can delay or drop scheduled runs. Extra runs are harmless. For each sport it:
 
 1. Downloads the files it published last time.
 2. Fetches the standings and schedule, and box scores for new final games, **plus every
@@ -155,7 +156,8 @@ a-Shell's folder instead: open it from the Files app to scroll through it, or us
 - **The NBA Cup final** (mid-December) doesn't count in the standings. If ESPN lists it as a
   regular-season game, the NBA standings check will fail and NBA updates will pause until
   the code skips that game.
-- **Scheduled runs can start late** when GitHub is busy, sometimes by up to an hour.
+- **Scheduled runs can start late, or be skipped,** when GitHub is busy, which is why there are
+  backup runs. If none ran by mid-morning, use **Run workflow** on the Actions tab.
 - **GitHub pauses schedules in repositories with no activity for 60 days.** If updates stop,
   open the Actions tab and re-enable the workflow.
 - **Both APIs are undocumented.** If one changes, the checks will most likely catch it and
