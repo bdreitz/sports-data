@@ -2989,6 +2989,13 @@ Sections (one per page):
   9. Selling early by situation: when
      he needs 1.5x/2x/3x his usual rate,
      foul trouble, blowouts
+  10. Collapsed 80c+ favorites, when
+     the BID (what the app shows) fell
+     to 40/30/20c: bid, ask, spread, how
+     often they still won, buying at the
+     ask vs at the bid
+  11. The same when the ASK fell there
+     (you could actually buy at it)
 
 Each result shows the season, a
 discovery period (earlier games) and a
