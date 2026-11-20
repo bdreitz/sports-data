@@ -185,10 +185,12 @@ a-Shell):
 | `kalshi_nba_checkpoints_YYYY-MM.parquet` | one row per contract per checkpoint: the bid and ask then (carried forward from the last candle), minutes since that quote, volume in the last 5 minutes, and the game state |
 | `kalshi_nba_windows_YYYY-MM.parquet` | one row per contract per window: the lowest ask (and the lowest intra-minute ask), when it happened, volume around it, and the game state then |
  
-**Checkpoints:** the first quote, 10am, noon and 3pm Eastern, 60 and 15 minutes before tip-off,
-tip-off (the baseline: entering right before the game), then every 2 minutes of **game clock**
+**Checkpoints:** the first quote, 10am, noon and 3pm Eastern, 60, 15, 5 and 2 minutes before
+tip-off, tip-off, then every 2 minutes of **game clock**
 through the third quarter (2:00, 4:00 ... 36:00 of game time), placed at the real moment the game clock
-reached them, so timeouts and reviews don't shift them. `CHECKPOINT_EVERY_GAME_MIN` and
+reached them, so timeouts and reviews don't shift them. Spreads often widen in the last minute
+before tip-off, so "entering right before the game" is best measured a few minutes earlier
+(`tip_minus_5` or `tip_minus_2`) as well as at `tip`. `CHECKPOINT_EVERY_GAME_MIN` and
 `CHECKPOINT_THROUGH_GAME_MIN` in `kalshi_nba.py` change them.
  
 **Windows:** the whole pregame day, the last hour before tip-off, and the first 6 minutes,
