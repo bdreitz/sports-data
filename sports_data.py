@@ -49,6 +49,8 @@ Add page=False to print it all at once, or save=True to save it to a file.
     nba_line_scan("rebounds")    rank today's players by their 80% line, highest first
     nfl_line_scan(), nhl_line_scan()
 
+    nhl_team_scan()              NHL team props for today: team shots, team goals, game total shots
+
     nfl_scan()                   consistent props (80%+ hit rate) for this week's NFL games
     nba_scan(), nhl_scan()       ...for today's NBA / NHL games
     nfl_scan(games=5)            over each player's last 5 games; games="season" for the whole season
@@ -705,7 +707,9 @@ SCAN_FLOOR = {
     ("nhl", "G", "saves"): 15, ("nhl", "*", "shots"): 2,
 }
 
-_SCAN_NAMES = {"passing_yards": "Pass Yards", "passing_tds": "Pass TDs", "rushing_yards": "Rush Yards",
+_SCAN_NAMES = {"goals_for": "Goals",
+               "shots_for": "Shots on Goal", "game_shots": "Shots on Goal",
+               "passing_yards": "Pass Yards", "passing_tds": "Pass TDs", "rushing_yards": "Rush Yards",
                "carries": "Rush Att", "receptions": "Receptions", "receiving_yards": "Rec Yards",
                "pts": "Points", "reb": "Rebounds", "ast": "Assists", "saves": "Saves",
                "shots": "Shots on Goal"}
@@ -1765,6 +1769,10 @@ def _matchup_spec(sport, position, stat):
             return "team", "opp_passing_tds", "pass TDs/g", "pass D", "defense"
         return "team", "opp_passing_yards", "pass yds/g", "pass D", "defense"
     if sport == "nhl":
+        if position == "TEAM":
+            if stat == "goals_for":
+                return "team", "goals_against", "goals/g allowed", "D", "defense"
+            return "team", "shots_against", "shots/g allowed", "D", "defense"
         if position == "G":
             return "team", "shots_for", "shots/g", "offense", "offense"
         return "team", "shots_against", "shots/g", "D", "defense"
@@ -1841,6 +1849,128 @@ class _Matchups:
 
 
 # ---------------------------------------------------------------------------
+# Team props (NHL): team shots on goal, team goals, game total shots
+# ---------------------------------------------------------------------------
+
+# Team stats checked per sport (columns in the team file), and game totals (both teams)
+TEAM_SCAN_STATS = {"nhl": ["shots_for", "goals_for"]}
+GAME_SCAN_STATS = {"nhl": ["game_shots"]}
+# The lowest line worth showing for each
+TEAM_SCAN_FLOOR = {("nhl", "shots_for"): 20, ("nhl", "goals_for"): 2, ("nhl", "game_shots"): 45}
+
+
+def _game_value(row, stat):
+    """A team-file row's value for a team or game stat."""
+    if stat == "game_shots":
+        a, b = _number(row.get("shots_for")), _number(row.get("shots_against"))
+        return None if a is None or b is None else a + b
+    return _number(row.get(stat))
+
+
+def _team_props(sport, size, min_hit, min_games, game):
+    """Consistent team and game-total props for one game: [dicts like the player props]."""
+    if sport not in TEAM_SCAN_STATS:
+        return []
+    by_team = {}
+    for r in _rows(sport, "team_games"):
+        by_team.setdefault(r["team"], []).append(r)
+    for rows in by_team.values():
+        rows.sort(key=lambda r: (r["game_date"], r["game_id"]))
+    found = []
+    for team, opponent in ((game["away"], game["home"]), (game["home"], game["away"])):
+        rows = by_team.get(team, [])
+        window = rows if size is None else rows[-size:]
+        for stat in TEAM_SCAN_STATS[sport]:
+            values = [_game_value(r, stat) or 0.0 for r in window]
+            if len(values) < min_games:
+                continue
+            best = _best_line(values, 1, TEAM_SCAN_FLOOR.get((sport, stat), 1), min_hit)
+            if best is None:
+                continue
+            line, hits, rate = best
+            average = sum(values) / len(values)
+            found.append({"kind": "team", "team": team, "opponent": opponent, "stat": stat,
+                          "line": line, "hits": hits, "n": len(values), "rate": rate, "avg": average,
+                          "low": min(values), "pool": rows, "name": team, "position": "TEAM"})
+    # Game totals: both teams' recent games together
+    for stat in GAME_SCAN_STATS.get(sport, []):
+        values = []
+        for team in (game["away"], game["home"]):
+            rows = by_team.get(team, [])
+            window = rows if size is None else rows[-size:]
+            values += [_game_value(r, stat) or 0.0 for r in window]
+        if len(values) < 2 * min_games:
+            continue
+        best = _best_line(values, 1, TEAM_SCAN_FLOOR.get((sport, stat), 1), min_hit)
+        if best is None:
+            continue
+        line, hits, rate = best
+        found.append({"kind": "game", "team": f"{game['away']} @ {game['home']}", "stat": stat,
+                      "line": line, "hits": hits, "n": len(values), "rate": rate,
+                      "avg": sum(values) / len(values), "low": min(values)})
+    order = {game["away"]: 0, game["home"]: 1}
+    stats = TEAM_SCAN_STATS[sport]
+    found.sort(key=lambda c: (c["kind"] == "game", order.get(c["team"], 2),
+                              stats.index(c["stat"]) if c["stat"] in stats else 0))
+    return found
+
+
+def _team_prop_lines(c, matchups, log, span):
+    line = c["line"]
+    name = _SCAN_NAMES.get(c["stat"], c["stat"])
+    if c["kind"] == "game":
+        return [f"{c['rate']:.0%} game total",
+                f"  {name} {line:g}+ (over {line - 0.5:g})",
+                f"  hit {c['hits']}/{c['n']} | both teams' {span.replace(' games', '')}",
+                f"  avg {c['avg']:.1f} | low {c['low']:g}"]
+    lines = [f"{c['rate']:.0%} {c['team']} team",
+             f"  {name} {line:g}+ (over {line - 0.5:g})",
+             f"  hit {c['hits']}/{c['n']} | avg {c['avg']:.1f} | low {c['low']:g}"]
+    lines += matchups.describe("TEAM", c["stat"], c["opponent"])
+    if log:
+        lines += _log_lines(c, log)
+    return lines
+
+
+@_paged
+def nhl_team_scan(games=10, min_hit=0.80, team=None, day=None, log=10, min_games=5):
+    """
+    Consistent NHL team props for today's games: team shots on goal, team goals, and game total
+    shots (both teams' recent games together), with the opponent's defense and a recent log.
+    nhl_team_scan()                 today, last 10 games, 80%+ hit rate
+    nhl_team_scan(games=5), games="season", min_hit=0.9, team="NYR", log=0
+    day=datetime.date(...) for another day.
+    """
+    size, span = _window(games)
+    day = day or _today()
+    try:
+        todays = _games_today("nhl", day)
+    except Exception as e:
+        print(f"Couldn't load today's NHL schedule ({e}).")
+        return
+    if team:
+        wanted = team.strip().upper()
+        todays = [g for g in todays if wanted in (g["home"], g["away"])]
+    print(f"NHL team scan | {day.month}/{day.day}")
+    print(f"{span} | {min_hit:.0%}+ hit rate")
+    if not todays:
+        print("No NHL games found.")
+        return
+    matchups = _Matchups("nhl")
+    records = _records("nhl")
+    for g in sorted(todays, key=lambda g: (g["start"] or datetime.datetime.max, g["away"])):
+        out = ["", "=" * 34, f"{_clock(g['start'])} | NHL",
+               f"{g['away']} ({records.get(g['away'], '0-0')}) @ {g['home']} ({records.get(g['home'], '0-0')})",
+               "=" * 34]
+        props = _team_props("nhl", size, min_hit, min_games, g)
+        if not props:
+            out.append("  nothing clears the bar")
+        for c in props:
+            out += _team_prop_lines(c, matchups, log, span)
+        print("\n".join(out))
+
+
+# ---------------------------------------------------------------------------
 # Today's props across every sport
 # ---------------------------------------------------------------------------
 
@@ -1879,7 +2009,13 @@ def daily(games=10, min_hit=0.80, min_games=5, per_game=8, day=None, log=10):
         for g in todays:
             props = [c for c in found if c["team"] in (g["home"], g["away"])]
             injuries = _injury_summary_or_note(sport, [g["away"], g["home"]])
-            entries.append((g, sport, props[:per_game], len(props), records, matchups, injuries))
+            try:
+                team_props = _team_props(sport, size, min_hit, min_games, g)
+            except Exception as e:
+                team_props = []
+                notes.append(f"{sport.upper()}: couldn't build team props ({e})")
+            entries.append((g, sport, props[:per_game], len(props), records, matchups, injuries,
+                            team_props))
 
     entries.sort(key=lambda e: (e[0]["start"] or datetime.datetime.max, e[1], e[0]["away"], e[0]["home"]))
     out = [f"Props for {day.strftime('%a')} {day.month}/{day.day}", f"{span} | {min_hit:.0%}+ hit rate"]
@@ -1887,13 +2023,18 @@ def daily(games=10, min_hit=0.80, min_games=5, per_game=8, day=None, log=10):
     if not entries:
         out.append("No NFL, NBA or NHL games today." if not notes else "")
     goalie = False
-    for g, sport, props, total, records, matchups, injuries in entries:
+    for g, sport, props, total, records, matchups, injuries, team_props in entries:
         away, home = g["away"], g["home"]
         out += ["", "=" * 34,
                 f"{_clock(g['start'])} | {sport.upper()}",
                 f"{away} ({records.get(away, '0-0')}) @ {home} ({records.get(home, '0-0')})",
                 "=" * 34]
         out += injuries
+        if team_props:
+            out.append("Team props:")
+            for c in team_props:
+                out += _team_prop_lines(c, matchups, log, span)
+            out.append("Player props:")
         if not props:
             out.append("  nothing clears the bar")
             continue
@@ -2065,6 +2206,11 @@ Injuries (regulars):
    PIT 261  @DEN 263    LV 288
   @LAC 310   MIA 254   @SF 266
    SEA 276
+
+NHL games also list team props first:
+team shots on goal, team goals, and
+game total shots (both teams' recent
+games together).
 
 Reading it:
 - 90% = hit rate; 250+ means 250 or
@@ -2243,6 +2389,11 @@ Checked stats:
   NBA: points, rebounds, assists
   NHL: shots on goal; goalies: saves
     (games he started only)
+
+NHL team props (team shots on goal,
+team goals, game total shots):
+  nhl_team_scan()
+  nhl_team_scan(team="NYR", games=5)
 
 Usage:
   nba_scan()
@@ -2435,6 +2586,10 @@ Scanner and report:
                 1 otherwise)
   SCAN_STATS    stats checked per
                 position
+  TEAM_SCAN_STATS, GAME_SCAN_STATS,
+  TEAM_SCAN_FLOOR  NHL team props
+                (floors: 20 shots,
+                2 goals, 45 game shots)
 
 Injury summaries:
   REGULAR_NBA_MINUTES = 15
@@ -2656,7 +2811,8 @@ _GUIDE_ALIASES = {
     "nhl_columns": "columns", "stats": "columns", "page": "paging", "save": "paging",
     "setting": "settings", "code": "codes", "getting started": "start", "help": "start",
     "standing": "standings", "nfl_standings": "standings", "nba_standings": "standings",
-    "nhl_standings": "standings", "records": "standings",
+    "nhl_standings": "standings", "records": "standings", "nhl_team_scan": "scan",
+    "team props": "scan", "team_props": "scan",
     "leader": "leaders", "nfl_leaders": "leaders", "nba_leaders": "leaders",
     "nhl_leaders": "leaders", "player standings": "leaders", "player_standings": "leaders",
     "leaderboard": "leaders", "leaderboards": "leaders",
