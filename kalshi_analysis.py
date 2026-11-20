@@ -43,6 +43,12 @@ WINDOWS = {"Q1": (1, 12), "Q2": (13, 24), "Q3": (25, 36)}   # game-clock minutes
 PREGAME = ["first_quote", "10am", "noon", "3pm", "tip_minus_60", "tip_minus_15",
            "tip_minus_5", "tip_minus_2", "tip"]
 STAT_NAMES = {"pts": "points", "reb": "rebounds", "ast": "assists"}
+# Section 6: favorites priced around 80% shortly before tip-off
+FAVORITE_CHECKPOINT = "tip_minus_15"
+FAVORITE_BAND = (0.75, 0.85)               # "priced at about 80%"
+LIMIT_LEVELS = (0.78, 0.75, 0.72, 0.70, 0.65)
+FAVORITE_WINDOWS = {"game_q1": ("Q1", 12), "game_first_half": ("first half", 24),
+                    "game_through_q3": ("through Q3", 36)}
 PERIOD_NAMES = {"all": "Season", "discovery": "Discovery", "check": "Check"}
 
 _rng = np.random.default_rng(7)
@@ -66,7 +72,12 @@ def load(folder):
     parts = [p for p in parts if p is not None]
     if not parts:
         raise SystemExit(f"No kalshi_nba_checkpoints files in {folder}")
-    return markets, pd.concat(parts, ignore_index=True)
+    months = sorted({f.split("kalshi_nba_windows_")[1].split(".")[0]
+                     for f in os.listdir(folder) if f.startswith("kalshi_nba_windows_")})
+    windows = [read_table(folder, f"kalshi_nba_windows_{m}") for m in months]
+    windows = [w for w in windows if w is not None]
+    return markets, pd.concat(parts, ignore_index=True), (pd.concat(windows, ignore_index=True)
+                                                           if windows else pd.DataFrame())
 
 
 def prepare(markets, checkpoints):
@@ -232,6 +243,50 @@ def study_game_state(cp):
     return pd.DataFrame(rows)
 
 
+def study_favorites(cp, windows):
+    """Favorites priced in FAVORITE_BAND at FAVORITE_CHECKPOINT: how low the price went in each
+    window (won / lost / all), and resting buy orders at LIMIT_LEVELS left open through that
+    window. Returns (lows, limits)."""
+    if windows.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    entry = cp[(cp["checkpoint"] == FAVORITE_CHECKPOINT) & cp["valid"]
+               & cp["ask"].between(FAVORITE_BAND[0], FAVORITE_BAND[1])]
+    entry = entry[["market_ticker", "ask", "result", "unit", "period_split", "flagged"]]
+    entry = entry.rename(columns={"ask": "entry_ask"})
+    game = cp[(cp["kind"] == "game") & cp["bid"].notna()]
+    lows_rows, limit_rows = [], []
+    for window, (name, last_minute) in FAVORITE_WINDOWS.items():
+        w = windows[windows["window"] == window][["market_ticker", "min_ask", "min_ask_low"]]
+        bids = (game[game["game_minute"] <= last_minute].groupby("market_ticker")["bid"].min()
+                .rename("min_bid").reset_index())
+        df = entry.merge(w, on="market_ticker", how="inner").merge(bids, on="market_ticker", how="left")
+        df["low"] = df["min_ask_low"].fillna(df["min_ask"])
+        df = df[df["low"].notna()]
+        for subset, part in (("flagged", df[df["flagged"]]), ("all", df)):
+            for outcome, group in (("won", part[part["result"] == 1]), ("lost", part[part["result"] == 0]),
+                                   ("all", part)):
+                if group.empty:
+                    continue
+                lows_rows.append({
+                    "window": name, "subset": subset, "outcome": outcome, "n": len(group),
+                    "hit": part["result"].mean(), "entry_ask": group["entry_ask"].mean(),
+                    "avg_low_ask": group["low"].mean(), "median_low_ask": group["low"].median(),
+                    "p25_low_ask": group["low"].quantile(0.25), "p75_low_ask": group["low"].quantile(0.75),
+                    "avg_low_bid": group["min_bid"].mean(),
+                    "share_ask_75": (group["low"] <= 0.75 + 1e-9).mean(),
+                    "share_ask_70": (group["low"] <= 0.70 + 1e-9).mean()})
+            if window == "game_through_q3":
+                continue                                        # orders: Q1 and first half
+            for level in LIMIT_LEVELS:
+                filled = part[part["low"] <= level + 1e-9].assign(limit=level)
+                summary = by_periods(filled, price="limit") if len(filled) else {
+                    "all": {"n": 0}, "discovery": {"n": 0}, "check": {"n": 0}}
+                limit_rows += rows_of(f"{int(level * 100)}c", summary, window=name, subset=subset,
+                                      limit=level, fill_rate=len(filled) / len(part) if len(part) else 0,
+                                      bets=len(part))
+    return pd.DataFrame(lows_rows), pd.DataFrame(limit_rows)
+
+
 # ---------------------------------------------------------------------------
 # Report (40 characters wide, one section per page)
 # ---------------------------------------------------------------------------
@@ -263,7 +318,7 @@ def _pick(df, **conditions):
             if (part["period"] == p).any()}
 
 
-def report(info, baseline, pregame, minutes, strategies, state):
+def report(info, baseline, pregame, minutes, strategies, state, lows=None, limits=None):
     out = ["Kalshi NBA props: entry backtest",
            f"{info['first_date']} to {info['last_date']}",
            f"profit per contract, cents, after fees", f"ranges: {CONFIDENCE:.0%} confidence"]
@@ -335,6 +390,51 @@ def report(info, baseline, pregame, minutes, strategies, state):
                 lines += [f" {value}"] + _line(p.get("all", {}))
     out += _section("5. WHY IT DIPPED", lines)
 
+    if lows is not None and not lows.empty:
+        lo_band, hi_band = (int(x * 100) for x in FAVORITE_BAND)
+        lines = [f"Priced {lo_band}-{hi_band}c 15 min before tip.",
+                 "Lowest ask (cents) in each window:"]
+        for subset in ("flagged", "all"):
+            part = lows[lows["subset"] == subset]
+            if part.empty:
+                continue
+            first = part.iloc[0]
+            lines += ["", f"{'Scanner-flagged' if subset == 'flagged' else 'All in that range'}: "
+                          f"hit {first['hit'] * 100:.0f}%"]
+            for name in dict.fromkeys(part["window"]):
+                lines.append(f" {name}:")
+                for _, r in part[part["window"] == name].iterrows():
+                    lines.append(f"  {r['outcome']:<4} n {int(r['n']):>4} avg {r['avg_low_ask'] * 100:.0f} "
+                                 f"med {r['median_low_ask'] * 100:.0f}")
+                allrow = part[(part["window"] == name) & (part["outcome"] == "all")]
+                if len(allrow):
+                    r = allrow.iloc[0]
+                    lines.append(f"  reached 75c: {r['share_ask_75'] * 100:.0f}%  70c: {r['share_ask_70'] * 100:.0f}%")
+        out += _section("6. 80% FAVORITES: HOW LOW?", lines)
+        lines = [f"Priced {lo_band}-{hi_band}c 15 min before tip.",
+                 "Resting buy order at a price, open",
+                 "through the window (filled if the",
+                 "ask touched it). Profit per fill:"]
+        for subset in ("flagged", "all"):
+            part = limits[(limits["subset"] == subset)]
+            if part.empty:
+                continue
+            lines += ["", "Scanner-flagged:" if subset == "flagged" else "All in that range:"]
+            for name in dict.fromkeys(part["window"]):
+                lines.append(f" {name}:")
+                for label in dict.fromkeys(part[part["window"] == name]["label"]):
+                    p = _pick(part[part["window"] == name], label=label)
+                    a = p.get("all", {})
+                    if not a.get("n"):
+                        lines.append(f"  {label}: never filled")
+                        continue
+                    d, c = p.get("discovery", {}), p.get("check", {})
+                    lines.append(f"  {label}: fills {a['fill_rate'] * 100:.0f}%, hit {a['hit'] * 100:.0f}%")
+                    rng = f"({_c(a.get('low'), True)},{_c(a.get('high'), True)})" if "low" in a and pd.notna(a.get("low")) else ""
+                    lines.append(f"   {_c(a['profit'], True)}c {rng}")
+                    lines.append(f"   disc {_c(d.get('profit'), True)} check {_c(c.get('profit'), True)}")
+        out += _section("7. 80% FAVORITES: BUY ORDERS", lines)
+
     out += _section("HOW TO READ THIS", [
         "profit: average result per contract",
         "  bought at the ask, minus price and",
@@ -356,16 +456,17 @@ def main():
     parser.add_argument("--data", default="kalshi_state")
     parser.add_argument("--out", default="analysis_out")
     args = parser.parse_args()
-    markets, checkpoints = load(args.data)
+    markets, checkpoints, windows = load(args.data)
     cp, _, info = prepare(markets, checkpoints)
+    lows, limits = study_favorites(cp, windows)
     results = {"baseline": study_baseline(cp), "pregame": study_pregame(cp),
                "minutes": study_minutes(cp), "strategies": study_strategies(cp),
-               "game_state": study_game_state(cp)}
+               "game_state": study_game_state(cp), "favorite_lows": lows, "favorite_limits": limits}
     os.makedirs(args.out, exist_ok=True)
     for name, df in results.items():
         df.to_csv(os.path.join(args.out, f"analysis_{name}.csv"), index=False)
     text = report(info, results["baseline"], results["pregame"], results["minutes"],
-                  results["strategies"], results["game_state"])
+                  results["strategies"], results["game_state"], lows, limits)
     with open(os.path.join(args.out, "analysis_report.txt"), "w", encoding="utf-8") as f:
         f.write(text)
     print(text)
