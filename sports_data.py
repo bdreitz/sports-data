@@ -2982,6 +2982,13 @@ Sections (one per page):
   7. Favorites: buy orders 3/5/8/10/15c
      below that price: how often they
      fill, and profit per fill
+  8. Selling early by price: sell when
+     the bid falls to 30/20/10c, or when
+     an 80c+ favorite falls to 60/50c,
+     vs holding to the end
+  9. Selling early by situation: when
+     he needs 1.5x/2x/3x his usual rate,
+     foul trouble, blowouts
 
 Each result shows the season, a
 discovery period (earlier games) and a
