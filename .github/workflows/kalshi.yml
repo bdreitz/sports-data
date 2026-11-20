@@ -1,0 +1,60 @@
+name: Kalshi NBA props history
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "probe = check one game and print (publishes nothing); update = add new games; backfill = rebuild the season"
+        type: choice
+        options: [probe, update, backfill]
+        default: probe
+  schedule:
+    - cron: "37 14 * * *"       # daily update, 9:37-10:37am Eastern, after last night's markets settle
+
+permissions:
+  contents: write               # needed to create and update the "kalshi-nba" release
+
+concurrency:
+  group: kalshi-nba
+  cancel-in-progress: false
+
+jobs:
+  kalshi:
+    runs-on: ubuntu-latest      # the standard runner: free on public repositories
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pandas and pyarrow
+        run: pip install pandas pyarrow
+
+      - name: Get the files published so far
+        if: inputs.mode != 'probe'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p kalshi_state
+          gh release download kalshi-nba --dir kalshi_state || echo "Nothing published yet."
+
+      - name: Run
+        run: python kalshi_nba.py --mode "${{ inputs.mode || 'update' }}" --state kalshi_state --out kalshi_out
+
+      - name: Publish to the "kalshi-nba" release
+        if: inputs.mode != 'probe'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view kalshi-nba >/dev/null 2>&1 || \
+            gh release create kalshi-nba --title "Kalshi NBA props history" \
+              --notes "Kalshi prices for NBA points, rebounds and assists props, minute by minute, joined to game state. Built by kalshi_nba.py."
+          shopt -s nullglob
+          files=(kalshi_out/*)
+          if [ ${#files[@]} -gt 0 ]; then
+            gh release upload kalshi-nba "${files[@]}" --clobber
+          else
+            echo "No new games to publish."
+          fi
