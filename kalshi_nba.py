@@ -13,6 +13,9 @@ Output (Parquet, or gzipped CSV if pyarrow isn't installed):
   kalshi_nba_markets.parquet          one row per contract: player, threshold, result, final
                                       stat, prices at tip-off, flags
   kalshi_nba_minutes_YYYY-MM.parquet  one row per contract per candle, with game state
+  kalshi_nba_checkpoints_YYYY-MM / kalshi_nba_windows_YYYY-MM   checkpoints and best entries
+  nba_pbp_YYYY-MM.jsonl.gz            every game's play-by-play and box score (one JSON line per
+                                      game), kept for building player profiles later
 
 Modes:
   python kalshi_nba.py --mode probe      check one recent game end to end; prints, writes nothing
@@ -24,6 +27,7 @@ import bisect
 import datetime as dt
 import gzip
 import json
+import math
 import os
 import re
 import sys
@@ -43,12 +47,18 @@ USER_AGENT = "sports-data-kalshi-backtest/1.0"
 # Kalshi series per stat. Assists isn't confirmed, so it's also looked up by title (see _series).
 SERIES = {"pts": "KXNBAPTS", "reb": "KXNBAREB", "ast": "KXNBAAST"}
 SERIES_TITLE_WORDS = {"pts": "points", "reb": "rebounds", "ast": "assists"}
-SEASON_START = dt.date(2026, 10, 1)          # props launched in October 2026
+SEASON_START = dt.date(2026, 10, 1)          # default start: the 2026-27 season (--since to change)
 
 # Kalshi team code -> ESPN team code, where they differ
 KALSHI_TO_ESPN = {"GSW": "GS", "NOP": "NO", "NYK": "NY", "SAS": "SA", "UTA": "UTAH", "WAS": "WSH"}
 
 PREGAME_MINUTE_CANDLES = 60                  # one-minute candles start this long before tip-off
+CHECKPOINT_EVERY_GAME_MIN = 2                # in-game checkpoints every 2 minutes of game clock...
+CHECKPOINT_THROUGH_GAME_MIN = 36             # ...through the end of the third quarter
+PREGAME_CHECKPOINTS_ET = {"10am": 10, "noon": 12, "3pm": 15}   # game-day clock times (Eastern)
+# Best-entry windows: (name, start, end). Game windows are in minutes of game clock.
+GAME_WINDOWS = {"game_first_6m": 6, "game_q1": 12, "game_first_half": 24, "game_through_q3": 36}
+FLAG_FLOORS = {"pts": 8, "reb": 3, "ast": 2}  # the scanner's minimum lines (SCAN_FLOOR)
 POSTGAME_MINUTES = 20                        # ...and run this long after the last play
 GAME_DAY_START_HOUR_ET = 8                   # hourly candles from 8am Eastern on game day
 MAX_EVENTS_PER_RUN = 1200                    # safety limit; the next run continues
@@ -194,9 +204,21 @@ def parse_candle(c):
         for key in ("open", "low", "high", "close"):
             out[f"{name}_{key}"] = _price(c.get(side), key)
     out["price_close"] = _price(c.get("price"), "close")
-    out["volume"] = c.get("volume")
-    out["open_interest"] = c.get("open_interest")
+    out["volume"] = _number(c.get("volume"), c.get("volume_fp"))
+    out["open_interest"] = _number(c.get("open_interest"), c.get("open_interest_fp"))
     return out
+
+
+def _number(*values):
+    """The first value that reads as a number (Kalshi sends some as fixed-point strings)."""
+    for v in values:
+        if v in (None, ""):
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def market_result(m):
@@ -361,9 +383,11 @@ class GameState:
 
     def __init__(self, summary):
         comp = ((summary.get("header") or {}).get("competitions") or [{}])[0]
-        self.team_side = {}
+        self.team_side, self.side_of = {}, {}
         for c in comp.get("competitors", []):
-            self.team_side[str((c.get("team") or {}).get("id"))] = c.get("homeAway")
+            team = c.get("team") or {}
+            self.team_side[str(team.get("id"))] = c.get("homeAway")
+            self.side_of[team.get("abbreviation")] = c.get("homeAway")
         # Box score: final totals and names, to check the rebuild
         self.box, self.names, self.player_team = {}, {}, {}
         for block in (summary.get("boxscore") or {}).get("players", []):
@@ -437,6 +461,13 @@ class GameState:
         matches = [pid for pid, n in self.names.items() if _person(n) == key]
         return matches[0] if len(matches) == 1 else None
 
+    def ts_at(self, elapsed_s):
+        """When the game clock first reached elapsed_s seconds of game time (Unix time), or None."""
+        for t, row in zip(self.game_times, self.game_rows):
+            if row["period"] >= 1 and row["elapsed_s"] >= elapsed_s:
+                return t
+        return None
+
     def at(self, ts, pid):
         """Game and player state at Unix time ts."""
         if self.tip_ts is None or ts < self.tip_ts:
@@ -449,6 +480,9 @@ class GameState:
         j = bisect.bisect_right(times, ts) - 1
         player = self.player_rows[pid][j] if j >= 0 else {"pts": 0, "reb": 0, "ast": 0, "fouls": 0}
         state.update({f"player_{k}": v for k, v in player.items()})
+        side = self.side_of.get(self.player_team.get(pid))
+        home, away = state.get("home_score") or 0, state.get("away_score") or 0
+        state["margin"] = (home - away if side == "home" else away - home) if side else None
         return state
 
 
@@ -460,14 +494,157 @@ def _int(value):
 
 
 # ---------------------------------------------------------------------------
+# Checkpoints and best-entry windows for one contract
+# ---------------------------------------------------------------------------
+
+def _quote_at(candles, times, t):
+    """The latest quote at Unix time t: the candle ending at or before t (prices carry forward
+    through minutes with no candle). Returns (candle or None, minutes since that candle)."""
+    i = bisect.bisect_right(times, t) - 1
+    if i < 0:
+        return None, None
+    return candles[i], round((t - candles[i]["ts"]) / 60, 1)
+
+
+def _volume_near(candles, times, t, before=300, after=0):
+    lo, hi = bisect.bisect_left(times, t - before), bisect.bisect_right(times, t + after)
+    total = sum(c["volume"] or 0 for c in candles[lo:hi] if c["interval"] == 1)
+    return total
+
+
+def contract_checkpoints(ticker, candles, state, pid, tip, day):
+    """One row per checkpoint: pregame clock times, tip-off, then every
+    CHECKPOINT_EVERY_GAME_MIN minutes of game clock through CHECKPOINT_THROUGH_GAME_MIN."""
+    candles = sorted(candles, key=lambda c: c["ts"])
+    times = [c["ts"] for c in candles]
+    points = []
+    if candles:
+        points.append(("first_quote", "pregame", candles[0]["ts"], None))
+    if day:
+        start = _game_day_start(day)                     # 8am Eastern
+        for label, hour in PREGAME_CHECKPOINTS_ET.items():
+            t = start + (hour - GAME_DAY_START_HOUR_ET) * 3600
+            if t < tip:
+                points.append((label, "pregame", t, None))
+    for label, minutes in (("tip_minus_60", 60), ("tip_minus_15", 15), ("tip", 0)):
+        points.append((label, "pregame", tip - minutes * 60, None))
+    if state is not None and state.tip_ts:
+        for m in range(CHECKPOINT_EVERY_GAME_MIN, CHECKPOINT_THROUGH_GAME_MIN + 1, CHECKPOINT_EVERY_GAME_MIN):
+            t = state.ts_at(m * 60)
+            if t is not None:
+                points.append((f"game_{m:02d}m", "game", t, m))
+    rows = []
+    for label, kind, t, game_min in points:
+        c, stale = _quote_at(candles, times, t)
+        row = {"market_ticker": ticker, "checkpoint": label, "kind": kind, "game_minute": game_min,
+               "ts": t, "bid": c["bid_close"] if c else None, "ask": c["ask_close"] if c else None,
+               "last": c["price_close"] if c else None, "minutes_since_quote": stale,
+               "volume_last_5m": _volume_near(candles, times, t)}
+        if state is not None and state.tip_ts:
+            row.update(state.at(t, pid))
+        rows.append(row)
+    return rows
+
+
+def contract_windows(ticker, candles, state, pid, tip):
+    """Best entry (lowest ask) in each window: the whole pregame day, the last hour before tip,
+    and the first 6 minutes / first quarter / first half of game clock."""
+    candles = sorted(candles, key=lambda c: c["ts"])
+    times = [c["ts"] for c in candles]
+    windows = [("pregame_day", times[0] - 1 if times else tip - 86400, tip),
+               ("pregame_last_hour", tip - 3600, tip)]
+    if state is not None and state.tip_ts:
+        for name, minutes in GAME_WINDOWS.items():
+            end = state.ts_at(minutes * 60)
+            if end is not None:
+                windows.append((name, tip, end))
+    rows = []
+    for name, start, end in windows:
+        inside = [c for c in candles if start < c["ts"] <= end and c["ask_close"] is not None]
+        row = {"market_ticker": ticker, "window": name, "start_ts": start, "end_ts": end,
+               "candles": len(inside)}
+        if inside:
+            best = min(inside, key=lambda c: (c["ask_close"], c["ts"]))
+            lows = [c["ask_low"] for c in inside if c["ask_low"] is not None]
+            row.update({"min_ask": best["ask_close"], "min_ask_ts": best["ts"],
+                        "min_ask_low": min(lows) if lows else None,
+                        "bid_then": best["bid_close"],
+                        "volume_near_min": _volume_near(candles, times, best["ts"], 120, 120)})
+            if state is not None and state.tip_ts:
+                row.update(state.at(best["ts"], pid))
+        rows.append(row)
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # One event -> rows
 # ---------------------------------------------------------------------------
 
 _games = {}
+_raw_games = {}          # game id -> compact play-by-play record, saved for later player profiles
+
+
+def compact_game(gid, day, summary):
+    """A compact copy of an ESPN game summary: every play (time, clock, type, text, players,
+    scoring, score) and every player's box score line, for building player profiles later
+    (scoring by quarter, pace through the game, streaks)."""
+    comp = ((summary.get("header") or {}).get("competitions") or [{}])[0]
+    teams = {}
+    for c in comp.get("competitors", []):
+        team = c.get("team") or {}
+        teams[c.get("homeAway")] = {"id": str(team.get("id")), "abbreviation": team.get("abbreviation")}
+    players = []
+    for block in (summary.get("boxscore") or {}).get("players", []):
+        team = (block.get("team") or {}).get("abbreviation")
+        for group in block.get("statistics", []):
+            labels = group.get("labels") or group.get("keys") or []
+            for a in group.get("athletes", []):
+                athlete = a.get("athlete") or {}
+                players.append({"id": str(athlete.get("id")), "name": athlete.get("displayName"),
+                                "team": team, "position": (athlete.get("position") or {}).get("abbreviation"),
+                                "starter": a.get("starter"), "did_not_play": a.get("didNotPlay"),
+                                "stats": dict(zip(labels, a.get("stats") or []))})
+    plays = []
+    for p in summary.get("plays", []):
+        plays.append({
+            "seq": p.get("sequenceNumber"), "wallclock": p.get("wallclock"),
+            "period": (p.get("period") or {}).get("number"), "clock": (p.get("clock") or {}).get("displayValue"),
+            "type": (p.get("type") or {}).get("text"), "text": p.get("text"),
+            "team": str((p.get("team") or {}).get("id")) if p.get("team") else None,
+            "players": [str(x["athlete"]["id"]) for x in p.get("participants") or []
+                        if (x.get("athlete") or {}).get("id") is not None],
+            "scoring": p.get("scoringPlay"), "points": p.get("scoreValue"), "shooting": p.get("shootingPlay"),
+            "home": p.get("homeScore"), "away": p.get("awayScore")})
+    return {"game_id": gid, "date": day.isoformat() if day else None, "teams": teams,
+            "players": players, "plays": plays}
+
+
+def write_play_by_play(new_games, state_dir, out_dir, mode, log=print):
+    """Add games to the monthly nba_pbp_YYYY-MM.jsonl.gz files (one JSON line per game)."""
+    by_month = {}
+    for g in new_games:
+        by_month.setdefault((g["date"] or "unknown")[:7], []).append(g)
+    os.makedirs(out_dir, exist_ok=True)
+    for month, games in by_month.items():
+        name = f"nba_pbp_{month}.jsonl.gz"
+        existing = {}
+        old_path = os.path.join(state_dir, name)
+        if mode != "backfill" and os.path.exists(old_path):
+            with gzip.open(old_path, "rt", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        record = json.loads(line)
+                        existing[record["game_id"]] = record
+        for g in games:
+            existing[g["game_id"]] = g
+        with gzip.open(os.path.join(out_dir, name), "wt", encoding="utf-8") as f:
+            for gid in sorted(existing, key=lambda x: (existing[x]["date"] or "", x)):
+                f.write(json.dumps(existing[gid], separators=(",", ":")) + "\n")
+        log(f"  play-by-play: {len(games)} games added to {name} ({len(existing)} in the file)")
 
 
 def process_event(stat, series, event_ticker, info, log=print):
-    """(market rows, minute rows) for one settled event."""
+    """(market rows, minute rows, checkpoint rows, window rows) for one settled event."""
     parsed = parse_event_ticker(event_ticker)
     markets = [m for m in info["markets"] if m.get("ticker")]
     base_flags = []
@@ -488,7 +665,10 @@ def process_event(stat, series, event_ticker, info, log=print):
         gid = game[0]
         if gid not in _games:
             try:
-                _games[gid] = GameState(espn(f"/summary?event={gid}"))
+                summary = espn(f"/summary?event={gid}")
+                _games[gid] = GameState(summary)
+                if summary.get("plays"):
+                    _raw_games[gid] = compact_game(gid, day, summary)
             except RuntimeError as e:
                 log(f"  {event_ticker}: ESPN summary unavailable ({e})")
                 _games[gid] = None
@@ -505,7 +685,7 @@ def process_event(stat, series, event_ticker, info, log=print):
         tip = max(closes) - 3 * 3600                      # rough fallback without play-by-play
     if tip is None or end is None:
         log(f"  {event_ticker}: no game times; skipped")
-        return [], []
+        return [], [], [], []
     day_start = _game_day_start(day) if day else tip - 12 * 3600
     hourly_start = max(day_start, min(opens) if opens else day_start)
     minute_start = tip - PREGAME_MINUTE_CANDLES * 60
@@ -514,7 +694,7 @@ def process_event(stat, series, event_ticker, info, log=print):
         if hourly_start < minute_start else {t: [] for t in tickers}
     minute = event_candles(series, event_ticker, minute_start, end, 1, info["archived"], tickers)
 
-    market_rows, minute_rows = [], []
+    market_rows, minute_rows, checkpoint_rows, window_rows = [], [], [], []
     bad = state.mismatches() if state and state.tip_ts else {}
     for m in markets:
         ticker = m["ticker"]
@@ -540,7 +720,7 @@ def process_event(stat, series, event_ticker, info, log=print):
             "player_name": name, "espn_player_id": pid,
             "team": state.player_team.get(pid) if state and pid else None,
             "threshold": threshold, "result": result, "settled_price": settled,
-            "final_stat": final_stat, "volume": m.get("volume"),
+            "final_stat": final_stat, "volume": _number(m.get("volume"), m.get("volume_fp")),
             "tip_ts": tip, "end_ts": end,
             "bid_at_tip": last_pre["bid_close"] if last_pre else None,
             "ask_at_tip": last_pre["ask_close"] if last_pre else None,
@@ -552,7 +732,106 @@ def process_event(stat, series, event_ticker, info, log=print):
             if state and state.tip_ts:
                 row.update(state.at(c["ts"], pid))
             minute_rows.append(row)
-    return market_rows, minute_rows
+        if candles:
+            checkpoint_rows += contract_checkpoints(ticker, candles, state if state and state.tip_ts else None,
+                                                    pid, tip, day)
+            window_rows += contract_windows(ticker, candles, state if state and state.tip_ts else None, pid, tip)
+    return market_rows, minute_rows, checkpoint_rows, window_rows
+
+
+# ---------------------------------------------------------------------------
+# What the scanner would have shown before each game (no peeking at later games)
+# ---------------------------------------------------------------------------
+
+def _nba_group(position):
+    position = str(position or "").upper()
+    if position.startswith("C"):
+        return "C"
+    if position.startswith("F") or position in ("SF", "PF"):
+        return "F"
+    return "G"
+
+
+def add_context(markets, folder, log=print):
+    """Add pre_* columns to the markets table: each player's numbers as they stood before that
+    game, from the published NBA player-games files (nba_*_player_games.csv) in `folder`:
+      pre_games, pre_avg_l5 / l10 / season, pre_hit_l10 / season (share of games at or above
+      the contract's threshold), pre_line80_l10 (his 80% line), pre_flagged80 (the scanner
+      would have shown this threshold), pre_rest_days, and the opponent's matchup then:
+      pre_opp, pre_opp_allowed (per game, to his position group), pre_opp_league, pre_opp_change,
+      pre_opp_rank (1 = allows the least), pre_opp_teams, pre_opp_verdict."""
+    import glob
+    markets = markets.drop(columns=[c for c in markets.columns if c.startswith("pre_")])
+    files = sorted(glob.glob(os.path.join(folder, "nba_*_player_games.csv")))
+    if not files:
+        log("  no NBA player-games file found: skipping the pre-game numbers")
+        return markets
+    games = pd.concat([pd.read_csv(f, dtype={"player_id": str, "game_id": str}) for f in files])
+    games["group"] = games["position"].map(_nba_group)
+    for stat in ("pts", "reb", "ast"):
+        games[stat] = pd.to_numeric(games[stat], errors="coerce").fillna(0)
+    history = {pid: g.sort_values(["game_date", "game_id"]) for pid, g in games.groupby("player_id")}
+    matchup_cache = {}
+
+    def matchups_before(date):
+        """{(defense, group): {stat: allowed per game}} and league averages, from games before date."""
+        if date not in matchup_cache:
+            prior = games[games["game_date"] < date]
+            totals = prior.groupby(["opponent", "group"])[["pts", "reb", "ast"]].sum()
+            played = prior.groupby("opponent")["game_id"].nunique()
+            table = {}
+            for (defense, group), row in totals.iterrows():
+                n = played.get(defense, 0)
+                if n:
+                    table[(defense, group)] = {s: row[s] / n for s in ("pts", "reb", "ast")}
+            matchup_cache[date] = table
+        return matchup_cache[date]
+
+    rows = []
+    for m in markets.itertuples(index=False):
+        out = {}
+        pid, date, stat, threshold = m.espn_player_id, m.game_date, m.stat, m.threshold
+        hist = history.get(str(pid)) if isinstance(pid, str) or pd.notna(pid) else None
+        if hist is not None and isinstance(date, str) and pd.notna(threshold):
+            before = hist[hist["game_date"] < date]
+            values = before[stat].tolist()
+            l5, l10 = values[-5:], values[-10:]
+            out["pre_games"] = len(values)
+            if values:
+                floor = FLAG_FLOORS.get(stat, 1)
+                ordered = sorted(l10, reverse=True)
+                line80 = ordered[max(1, math.ceil(0.8 * len(l10) - 1e-9)) - 1]
+                hit10 = sum(v >= threshold for v in l10) / len(l10)
+                out.update({
+                    "pre_avg_l5": sum(l5) / len(l5), "pre_avg_l10": sum(l10) / len(l10),
+                    "pre_avg_season": sum(values) / len(values), "pre_hit_l10": hit10,
+                    "pre_hit_season": sum(v >= threshold for v in values) / len(values),
+                    "pre_line80_l10": line80,
+                    "pre_flagged80": bool(len(l10) >= 5 and hit10 >= 0.8 - 1e-9 and threshold >= floor
+                                          and sum(l10) / len(l10) >= floor),
+                    "pre_rest_days": (dt.date.fromisoformat(date) -
+                                      dt.date.fromisoformat(before["game_date"].iloc[-1])).days})
+                team = m.team if isinstance(m.team, str) else before["team"].iloc[-1]
+                opponent = m.away if team == m.home else (m.home if team == m.away else None)
+                group = _nba_group(before["position"].iloc[-1])
+                table = matchups_before(date)
+                if opponent and (opponent, group) in table:
+                    pool = [v[stat] for (d, g), v in table.items() if g == group]
+                    value = table[(opponent, group)][stat]
+                    league = sum(pool) / len(pool)
+                    change = value / league - 1 if league else 0.0
+                    out.update({"pre_opp": opponent, "pre_opp_allowed": value, "pre_opp_league": league,
+                                "pre_opp_change": change,
+                                "pre_opp_rank": 1 + sum(1 for v in pool if v < value - 1e-9),
+                                "pre_opp_teams": len(pool),
+                                "pre_opp_verdict": "favorable" if change >= 0.05 else
+                                                   ("tough" if change <= -0.05 else "neutral")})
+        rows.append(out)
+    context = pd.DataFrame(rows, index=markets.index)
+    flagged = int(context.get("pre_flagged80", pd.Series(dtype=bool)).fillna(False).sum())
+    log(f"  pre-game numbers added for {context.notna().any(axis=1).sum()} of {len(markets)} contracts "
+        f"({flagged} the scanner would have flagged)")
+    return pd.concat([markets, context], axis=1)
 
 
 # ---------------------------------------------------------------------------
@@ -617,35 +896,69 @@ def probe(log=print):
         log("  first market: " + json.dumps({k: sample.get(k) for k in
             ("ticker", "title", "yes_sub_title", "subtitle", "floor_strike", "result",
              "settlement_value_dollars", "status", "open_time", "close_time", "volume")}))
-        markets, minutes = process_event(stat, series, ticker, info, log)
+        markets, minutes, checkpoints, windows = process_event(stat, series, ticker, info, log)
         frame = pd.DataFrame(minutes)
         log(f"  rows: {len(markets)} markets, {len(frame)} candles")
         if markets:
             flags = pd.Series([m["flags"] for m in markets]).value_counts().to_dict()
             log(f"  flags: {flags}")
-            m = next((x for x in markets if x["espn_player_id"]), markets[0])
-            log("  example: " + json.dumps({k: m[k] for k in ("player_name", "threshold", "result",
-                "final_stat", "bid_at_tip", "ask_at_tip", "flags")}))
-        if len(frame):
-            first = frame["market_ticker"].iloc[0]
+            clean = [x for x in markets if not x["flags"]] or markets
+            m = max(clean, key=lambda x: (len(frame[frame["market_ticker"] == x["market_ticker"]])
+                                          if len(frame) else 0, x["volume"] or 0))
+            log("  example: " + json.dumps({k: m[k] for k in ("market_ticker", "player_name", "threshold",
+                "result", "final_stat", "volume", "bid_at_tip", "ask_at_tip", "flags")}))
+        if len(frame) and markets:
+            # How complete are the in-game minutes? (a candle every minute, or only on changes)
+            live = frame[(frame["interval"] == 1) & (frame.get("phase") == "live")] if "phase" in frame else frame.iloc[0:0]
+            tip, end = markets[0]["tip_ts"], markets[0]["end_ts"]
+            game_minutes = max(1, (end - tip) // 60)
+            per_market = live.groupby("market_ticker").size()
+            clean_tickers = [x["market_ticker"] for x in markets if not x["flags"]]
+            per_clean = per_market.reindex(clean_tickers).fillna(0)
+            if len(per_clean):
+                log(f"  in-game minute candles per active contract: median {per_clean.median():.0f}, "
+                    f"min {per_clean.min():.0f}, max {per_clean.max():.0f} (game spans ~{game_minutes} minutes)")
+                vol = frame["volume"].dropna()
+                log(f"  candle volume: {len(vol)} of {len(frame)} candles have it; total {vol.sum():.0f}")
+            first = m["market_ticker"]
             one = frame[frame["market_ticker"] == first]
             cols = [c for c in ("ts", "interval", "bid_close", "ask_close", "ask_low", "price_close",
                                 "volume", "phase", "period", "clock_s", "player_pts", "player_reb",
                                 "player_ast") if c in one.columns]
             log(f"  candles for {first}: {len(one)} ({(one['interval'] == 1).sum()} one-minute)")
             log(one[cols].iloc[::max(1, len(one) // 12)].to_string(index=False))
+        if _raw_games:
+            raw = next(iter(_raw_games.values()))
+            size = len(gzip.compress(json.dumps(raw).encode()))
+            log(f"  play-by-play archive: {len(raw['plays'])} plays, {len(raw['players'])} players, "
+                f"~{size // 1024} KB compressed per game")
         game = next(iter(_games.values()), None)
         if game is not None:
             bad = game.mismatches()
             log(f"  play-by-play check: {len(game.box)} players, {len(bad)} don't match the box score")
             for pid, (got, box) in list(bad.items())[:5]:
                 log(f"    {game.names.get(pid)}: rebuilt {got}, box {box}")
+        if checkpoints and markets:
+            cp = pd.DataFrame(checkpoints)
+            one = cp[cp["market_ticker"] == m["market_ticker"]]
+            cols = [c for c in ("checkpoint", "bid", "ask", "minutes_since_quote", "volume_last_5m", "period",
+                                "clock_s", "player_pts", "player_reb", "player_ast", "player_fouls", "margin")
+                    if c in one.columns]
+            log(f"  checkpoints for {m['market_ticker']}:")
+            log(one[cols].to_string(index=False))
+            wn = pd.DataFrame(windows)
+            one = wn[wn["market_ticker"] == m["market_ticker"]]
+            cols = [c for c in ("window", "candles", "min_ask", "min_ask_low", "bid_then", "volume_near_min",
+                                "period", "clock_s", "player_pts", "player_fouls", "margin") if c in one.columns]
+            log("  best entries:")
+            log(one[cols].to_string(index=False))
 
 
-def run(mode, state_dir, out_dir, log=print):
+def run(mode, state_dir, out_dir, log=print, since=None):
+    since = since or SEASON_START
     stored = None if mode == "backfill" else read_table(state_dir, "kalshi_nba_markets")
     done = set(stored["event_ticker"]) if stored is not None else set()
-    new_markets, new_minutes, processed = [], [], 0
+    new_markets, new_minutes, new_checkpoints, new_windows, processed = [], [], [], [], 0
     for stat in SERIES:
         try:
             series = find_series(stat, log)
@@ -654,40 +967,49 @@ def run(mode, state_dir, out_dir, log=print):
             continue
         events = settled_events(series, log)
         todo = sorted(t for t in events
-                      if t not in done and (parse_event_ticker(t) or (dt.date.min,))[0] >= SEASON_START)
+                      if t not in done and (parse_event_ticker(t) or (dt.date.min,))[0] >= since)
         log(f"{stat} ({series}): {len(events)} settled events, {len(todo)} to add")
         for ticker in todo:
             if processed >= MAX_EVENTS_PER_RUN:
                 log(f"reached {MAX_EVENTS_PER_RUN} events this run; the next run continues")
                 break
             try:
-                markets, minutes = process_event(stat, series, ticker, events[ticker], log)
+                markets, minutes, checkpoints, windows = process_event(stat, series, ticker, events[ticker], log)
             except Exception as e:                    # one bad event shouldn't stop the run
                 log(f"  {ticker}: failed ({e})")
                 continue
             new_markets += markets
             new_minutes += minutes
+            new_checkpoints += checkpoints
+            new_windows += windows
             processed += 1
             if processed % 25 == 0:
                 log(f"  {processed} events processed")
     log(f"processed {processed} events: {len(new_markets)} markets, {len(new_minutes)} candles")
+    if _raw_games:
+        write_play_by_play(list(_raw_games.values()), state_dir, out_dir, mode, log)
     if not new_markets:
         return
     markets = pd.DataFrame(new_markets)
     if stored is not None:
         markets = pd.concat([stored[~stored["market_ticker"].isin(markets["market_ticker"])], markets])
+    markets = add_context(markets.reset_index(drop=True), state_dir, log)
     write_table(markets.sort_values(["game_date", "event_ticker", "market_ticker"]), out_dir,
                 "kalshi_nba_markets")
-    minutes = pd.DataFrame(new_minutes)
-    if len(minutes):
-        dates = markets.set_index("market_ticker")["game_date"]
-        minutes["month"] = minutes["market_ticker"].map(dates).str[:7]
-        for month, part in minutes.groupby("month"):
-            old = None if mode == "backfill" else read_table(state_dir, f"kalshi_nba_minutes_{month}")
+    dates = markets.set_index("market_ticker")["game_date"]
+    for name, rows, order in (("minutes", new_minutes, ["market_ticker", "ts"]),
+                              ("checkpoints", new_checkpoints, ["market_ticker", "ts"]),
+                              ("windows", new_windows, ["market_ticker", "start_ts", "end_ts"])):
+        frame = pd.DataFrame(rows)
+        if not len(frame):
+            continue
+        frame["month"] = frame["market_ticker"].map(dates).str[:7]
+        for month, part in frame.groupby("month"):
+            old = None if mode == "backfill" else read_table(state_dir, f"kalshi_nba_{name}_{month}")
             part = part.drop(columns="month")
             if old is not None:
                 part = pd.concat([old[~old["market_ticker"].isin(part["market_ticker"])], part])
-            write_table(part.sort_values(["market_ticker", "ts"]), out_dir, f"kalshi_nba_minutes_{month}")
+            write_table(part.sort_values(order), out_dir, f"kalshi_nba_{name}_{month}")
     flagged = markets["flags"].fillna("").str.len().gt(0).sum()
     log(f"stored {len(markets)} markets in total ({flagged} with flags)")
 
@@ -697,13 +1019,15 @@ def main():
     parser.add_argument("--mode", choices=["probe", "update", "backfill"], default="update")
     parser.add_argument("--state", default="kalshi_state", help="folder with files published so far")
     parser.add_argument("--out", default="kalshi_out", help="folder for the files to publish")
+    parser.add_argument("--since", default="", help="first game date to include, e.g. 2025-10-01")
     args = parser.parse_args()
+    since = dt.date.fromisoformat(args.since) if args.since else SEASON_START
     if not _have_parquet():
         print("(pyarrow isn't installed: writing gzipped CSV instead of Parquet)")
     if args.mode == "probe":
         probe()
     else:
-        run(args.mode, args.state, args.out)
+        run(args.mode, args.state, args.out, since=since)
 
 
 if __name__ == "__main__":
