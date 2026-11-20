@@ -57,6 +57,15 @@ DIP_SIZES = (0.05, 0.10, 0.15)             # "dipped this far below the 15-minut
 LIMIT_OFFSETS = (0.03, 0.05, 0.08, 0.10, 0.15)   # buy orders this far below it
 FAVORITE_WINDOWS = {"game_q1": ("Q1", 12), "game_first_half": ("first half", 24),
                     "game_through_q3": ("through Q3", 36)}
+# Section 8: selling early vs holding to the end (from the minute-by-minute prices)
+SELL_STEP = 3                              # look every 3 minutes of game clock
+SELL_WINDOWS = {"Q1": (1, 12), "Q2": (13, 24), "Q3": (25, 36), "Q4": (37, 47)}
+SELL_BIDS = (0.30, 0.20, 0.10)             # "the bid falls to this"
+NEED_RATIOS = (1.5, 2.0, 3.0)              # "needs this many times his usual rate"
+COLLAPSE_FROM = 0.80                       # favorites priced at least this 15 min before tip...
+COLLAPSE_TO = (0.60, 0.50)                 # ...whose bid falls to this
+MINUTE_COLUMNS = ["market_ticker", "ts", "interval", "bid_close", "ask_close", "volume", "phase",
+                  "elapsed_s", "player_pts", "player_reb", "player_ast", "player_fouls", "margin"]
 PERIOD_NAMES = {"all": "Season", "discovery": "Discovery", "check": "Check"}
 
 _rng = np.random.default_rng(7)
@@ -88,6 +97,25 @@ def load(folder):
                                                            if windows else pd.DataFrame())
 
 
+def load_minutes(folder):
+    """In-game one-minute candles from the kalshi_nba_minutes files, needed columns only."""
+    parts = []
+    for name in sorted(os.listdir(folder)):
+        if not name.startswith("kalshi_nba_minutes_"):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            if name.endswith(".parquet"):
+                df = pd.read_parquet(path, columns=MINUTE_COLUMNS)
+            else:
+                df = pd.read_csv(path, usecols=lambda c: c in MINUTE_COLUMNS)
+        except Exception as e:
+            print(f"  couldn't read {name} ({e})")
+            continue
+        parts.append(df[(df["interval"] == 1) & (df["phase"] == "live")])
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=MINUTE_COLUMNS)
+
+
 def prepare(markets, checkpoints):
     """Clean contracts (settled yes/no, no flags), each checkpoint joined to its contract, plus
     the baseline quote. Returns (checkpoints, baseline, info)."""
@@ -105,6 +133,7 @@ def prepare(markets, checkpoints):
     dates = sorted(clean["game_date"].dropna().unique())
     split = dates[min(len(dates) - 1, int(len(dates) * SPLIT_QUANTILE))] if dates else None
     info.update(clean=len(clean), flagged=int(clean["flagged"].sum()), split=split)
+    info["clean_markets"] = clean
     keep = ["market_ticker", "result", "unit", "game_date", "stat", "threshold", "flagged",
             "pre_avg_l10", "pre_hit_l10", "player_name"]
     keep = [c for c in keep if c in clean.columns]
@@ -124,12 +153,16 @@ def prepare(markets, checkpoints):
 # Summaries
 # ---------------------------------------------------------------------------
 
-def summarize(df, price="ask"):
+def summarize(df, price="ask", side="buy"):
     """n, units, average price, hit rate, edge (hit - price) and profit after fees, with a
-    confidence range from resampling player-games."""
+    confidence range from resampling player-games. side="sell": the value of selling at that
+    price instead of holding to the end, price - fee - result (+ = selling was better)."""
     if df.empty:
         return {"n": 0, "units": 0}
-    profit = df["result"] - df[price] - fee(df[price])
+    if side == "sell":
+        profit = df[price] - fee(df[price]) - df["result"]
+    else:
+        profit = df["result"] - df[price] - fee(df[price])
     out = {"n": len(df), "units": df["unit"].nunique(), "price": df[price].mean(),
            "hit": df["result"].mean(), "edge": df["result"].mean() - df[price].mean(),
            "profit": profit.mean()}
@@ -143,11 +176,11 @@ def summarize(df, price="ask"):
     return out
 
 
-def by_periods(df, price="ask"):
+def by_periods(df, price="ask", side="buy"):
     """The summary for the whole season, the discovery period and the check period."""
-    return {"all": summarize(df, price),
-            "discovery": summarize(df[df["period_split"] == "discovery"], price),
-            "check": summarize(df[df["period_split"] == "check"], price)}
+    return {"all": summarize(df, price, side),
+            "discovery": summarize(df[df["period_split"] == "discovery"], price, side),
+            "check": summarize(df[df["period_split"] == "check"], price, side)}
 
 
 def rows_of(label, periods, **extra):
@@ -303,6 +336,72 @@ def study_favorites(cp, windows):
     return pd.DataFrame(lows_rows), pd.DataFrame(limit_rows)
 
 
+def sell_points(minutes, clean, cp):
+    """One row per contract every SELL_STEP minutes of game clock: the first in-game candle at or
+    after that minute, with the bid, the game state, what he still needs, and how that compares
+    with his usual rate (his last-10 average spread over a 48-minute game)."""
+    if minutes.empty:
+        return pd.DataFrame()
+    m = minutes.dropna(subset=["elapsed_s", "bid_close"]).copy()
+    m["slot"] = (m["elapsed_s"] // (SELL_STEP * 60)) * SELL_STEP
+    m = m[(m["slot"] >= SELL_STEP) & (m["slot"] < 48)]
+    m = m.sort_values(["market_ticker", "ts"]).groupby(["market_ticker", "slot"], as_index=False).first()
+    keep = [c for c in ("market_ticker", "result", "unit", "game_date", "stat", "threshold", "flagged",
+                        "pre_avg_l10") if c in clean.columns]
+    m = m.merge(clean[keep], on="market_ticker", how="inner")
+    split = cp[["market_ticker", "period_split"]].drop_duplicates("market_ticker")
+    pregame = cp[cp["checkpoint"] == FAVORITE_CHECKPOINT][["market_ticker", "ask"]].rename(
+        columns={"ask": "pregame_ask"})
+    m = m.merge(split, on="market_ticker", how="inner").merge(pregame, on="market_ticker", how="left")
+    m["stat_now"] = np.select([m["stat"] == st for st in ("pts", "reb", "ast")],
+                              [m.get(f"player_{st}", pd.Series(np.nan, index=m.index))
+                               for st in ("pts", "reb", "ast")], np.nan)
+    m["needed"] = m["threshold"] - m["stat_now"]
+    m = m[(m["needed"] > 0) & (m["bid_close"] >= 0.01)]           # already over the line: nothing to sell
+    rate = m["pre_avg_l10"] / 48 if "pre_avg_l10" in m else np.nan
+    expected = rate * (48 - m["slot"]).clip(lower=1)
+    m["need_ratio"] = np.where(expected > 0, m["needed"] / expected, np.nan)
+    m["spread"] = m["ask_close"] - m["bid_close"]
+    m["liquid"] = (m["spread"] <= MAX_SPREAD + 1e-9) & (m["volume"].fillna(0) >= MIN_VOLUME)
+    m["foul_trouble"] = m["player_fouls"].fillna(0) >= np.select(
+        [m["slot"] < 12, m["slot"] < 24, m["slot"] < 36], [2, 3, 4], 5)
+    m["blowout"] = m["margin"].abs() >= 15
+    return m.rename(columns={"bid_close": "bid"})
+
+
+def _first_sale(points, window, mask, liquid_only=False):
+    start, end = SELL_WINDOWS[window]
+    hit = points[mask & points["slot"].between(start - 1, end)]
+    if liquid_only:
+        hit = hit[hit["liquid"]]
+    return hit.sort_values("slot").groupby("market_ticker", as_index=False).first()
+
+
+def study_selling(points):
+    """Sell at the first moment in a quarter that a rule is met, vs holding to the end."""
+    if points.empty:
+        return pd.DataFrame()
+    rules = []
+    for level in SELL_BIDS:
+        rules.append(("price", f"bid <= {int(level * 100)}c", points["bid"] <= level + 1e-9))
+    for ratio in NEED_RATIOS:
+        rules.append(("needs", f"needs {ratio:g}x his rate", points["need_ratio"] >= ratio))
+    for level in COLLAPSE_TO:
+        rules.append(("collapse", f"{int(COLLAPSE_FROM * 100)}c+ fav, bid <= {int(level * 100)}c",
+                      (points["pregame_ask"] >= COLLAPSE_FROM - 1e-9) & (points["bid"] <= level + 1e-9)))
+    rules.append(("state", "foul trouble", points["foul_trouble"]))
+    rules.append(("state", "blowout (15+)", points["blowout"]))
+    rows = []
+    for family, label, mask in rules:
+        for window in SELL_WINDOWS:
+            for liquid in (False, True):
+                sales = _first_sale(points, window, mask, liquid)
+                rows += rows_of(f"{window} {label}", by_periods(sales, price="bid", side="sell"),
+                                family=family, rule=label, window=window,
+                                subset="liquid" if liquid else "all")
+    return pd.DataFrame(rows)
+
+
 # ---------------------------------------------------------------------------
 # Report (40 characters wide, one section per page)
 # ---------------------------------------------------------------------------
@@ -334,7 +433,7 @@ def _pick(df, **conditions):
             if (part["period"] == p).any()}
 
 
-def report(info, baseline, pregame, minutes, strategies, state, lows=None, limits=None):
+def report(info, baseline, pregame, minutes, strategies, state, lows=None, limits=None, selling=None):
     out = ["Kalshi NBA props: entry backtest",
            f"{info['first_date']} to {info['last_date']}",
            f"profit per contract, cents, after fees", f"ranges: {CONFIDENCE:.0%} confidence"]
@@ -451,6 +550,39 @@ def report(info, baseline, pregame, minutes, strategies, state, lows=None, limit
                     lines.append(f"   {rng}d {_c(d.get('profit'), True)} c {_c(c.get('profit'), True)}")
         out += _section("7. FAVORITES: BUY ORDERS", lines)
 
+    if selling is not None and not selling.empty:
+        intro = ["value = bid - fee - (1 if it won).",
+                 "+ means selling then beat holding",
+                 "to the end. Sell at the first time",
+                 "the rule is met in that quarter.",
+                 "(Buying 'No' works out the same.)"]
+
+        def rule_lines(family_list):
+            lines = []
+            for family in family_list:
+                part = selling[(selling["family"] == family) & (selling["subset"] == "all")]
+                for label in dict.fromkeys(part["label"]):
+                    p = _pick(part, label=label)
+                    a = p.get("all", {})
+                    if not a.get("n"):
+                        continue
+                    d, c = p.get("discovery", {}), p.get("check", {})
+                    liq = _pick(selling[(selling["subset"] == "liquid")], label=label).get("all", {})
+                    rng = (f"({_c(a.get('low'), True)},{_c(a.get('high'), True)})"
+                           if pd.notna(a.get("low", np.nan)) else "")
+                    lines += [f" {label}:",
+                              f"  n {a['n']} bid {_c(a['price'])}c won {a['hit'] * 100:.0f}%",
+                              f"  {_c(a['profit'], True)}c {rng}",
+                              f"  disc {_c(d.get('profit'), True)} check {_c(c.get('profit'), True)}"
+                              f" liquid {_c(liq.get('profit'), True)}"]
+            return lines
+        out += _section("8. SELLING EARLY: BY PRICE", intro + [""] + rule_lines(["price", "collapse"]))
+        out += _section("9. SELLING EARLY: BY SITUATION", intro[:2] + [
+            "needs Nx: what he still needs vs",
+            "his last-10 average over the time",
+            "left. foul trouble: 2+ fouls in Q1,",
+            "3+ in Q2, 4+ in Q3, 5+ in Q4.", ""] + rule_lines(["needs", "state"]))
+
     out += _section("HOW TO READ THIS", [
         "profit: average result per contract",
         "  bought at the ask, minus price and",
@@ -475,14 +607,17 @@ def main():
     markets, checkpoints, windows = load(args.data)
     cp, _, info = prepare(markets, checkpoints)
     lows, limits = study_favorites(cp, windows)
+    points = sell_points(load_minutes(args.data), info["clean_markets"], cp)
+    selling = study_selling(points)
     results = {"baseline": study_baseline(cp), "pregame": study_pregame(cp),
                "minutes": study_minutes(cp), "strategies": study_strategies(cp),
-               "game_state": study_game_state(cp), "favorite_lows": lows, "favorite_limits": limits}
+               "game_state": study_game_state(cp), "favorite_lows": lows, "favorite_limits": limits,
+               "selling": selling}
     os.makedirs(args.out, exist_ok=True)
     for name, df in results.items():
         df.to_csv(os.path.join(args.out, f"analysis_{name}.csv"), index=False)
     text = report(info, results["baseline"], results["pregame"], results["minutes"],
-                  results["strategies"], results["game_state"], lows, limits)
+                  results["strategies"], results["game_state"], lows, limits, selling)
     with open(os.path.join(args.out, "analysis_report.txt"), "w", encoding="utf-8") as f:
         f.write(text)
     print(text)
