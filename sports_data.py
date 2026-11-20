@@ -51,6 +51,8 @@ Add page=False to print it all at once, or save=True to save it to a file.
 
     nhl_team_scan()              NHL team props for today: team shots, team goals, game total shots
 
+    kalshi_report()              the Kalshi NBA entry backtest: when to buy props, profit after fees
+
     nfl_scan()                   consistent props (80%+ hit rate) for this week's NFL games
     nba_scan(), nhl_scan()       ...for today's NBA / NHL games
     nfl_scan(games=5)            over each player's last 5 games; games="season" for the whole season
@@ -2206,6 +2208,26 @@ def daily_report():
 
 
 # ---------------------------------------------------------------------------
+# Kalshi backtest report
+# ---------------------------------------------------------------------------
+
+@_paged
+def kalshi_report():
+    """
+    The latest Kalshi NBA entry backtest (built by the "Kalshi NBA entry backtest" workflow):
+    buying shortly before tip-off vs earlier in the day and in-game dips, profit after fees.
+    One section per page; kalshi_report(save=True) saves it to a file.
+    """
+    url = f"https://github.com/{REPO}/releases/download/kalshi-analysis/analysis_report.txt"
+    try:
+        print(_get_text(url).rstrip("\n"))
+    except Exception as e:
+        print(f"No backtest report yet ({e}).")
+        print("Run the Kalshi NBA entry backtest")
+        print("workflow from the Actions tab first.")
+
+
+# ---------------------------------------------------------------------------
 # Built-in guide: guide() lists the topics, guide("daily") shows one
 # ---------------------------------------------------------------------------
 
@@ -2925,8 +2947,47 @@ Rebounds
 ...
 ''')
 
+GUIDE["kalshi"] = ("kalshi_report(): entry backtest", '''
+KALSHI_REPORT()
+
+The latest backtest of when to buy
+Kalshi NBA props (points, rebounds,
+assists): buying 5 minutes before
+tip-off vs earlier in the day, or
+after in-game price dips. Profit is
+per contract, in cents, after fees.
+
+Usage:
+  kalshi_report()
+  kalshi_report(save=True)
+
+Sections (one per page):
+  1. Buying 5 min before tip-off, the
+     baseline, by price
+  2. Pregame timing: 10am, noon, 3pm
+     ... vs the baseline
+  3. Buying at each game minute, and
+     only after a 10c+ dip
+  4. Dip strategies: buy at the first
+     5/10/20c dip in Q1, Q2 or Q3
+  5. Why it dipped: pace, foul trouble,
+     score
+
+Each result shows the season, a
+discovery period (earlier games) and a
+check period (later games). Trust
+patterns that hold up in both, with
+enough entries (n), and a range that
+stays above 0.
+
+Built by the "Kalshi NBA entry
+backtest" workflow (Mondays, or run it
+from the Actions tab).
+''')
+
 _GUIDE_ORDER = ["start", "report", "daily", "players", "teams", "standings", "leaders",
-                "scan", "lines", "injuries", "columns", "status", "paging", "settings", "codes"]
+                "scan", "lines", "kalshi", "injuries", "columns", "status", "paging", "settings",
+                "codes"]
 _GUIDE_ALIASES = {
     "daily_report": "report", "players": "players", "player": "players", "nfl": "players",
     "nba": "players", "nhl": "players", "team": "teams", "nfl_team": "teams",
@@ -2944,7 +3005,7 @@ _GUIDE_ALIASES = {
     "leaderboard": "leaders", "leaderboards": "leaders",
     "line": "lines", "line scan": "lines", "line_scan": "lines", "nfl_line_scan": "lines",
     "nba_line_scan": "lines", "nhl_line_scan": "lines", "gap": "lines", "gaps": "lines",
-    "80%": "lines", "consistency": "lines", "gap scan": "lines", "gap_scan": "lines",
+    "80%": "lines", "consistency": "lines", "kalshi_report": "kalshi", "backtest": "kalshi", "gap scan": "lines", "gap_scan": "lines",
     "nfl_gap_scan": "lines", "nba_gap_scan": "lines", "nhl_gap_scan": "lines",
     "usage": "start", "guide": "start",
 }
