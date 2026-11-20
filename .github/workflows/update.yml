@@ -1,8 +1,14 @@
 name: Update stats
 
 on:
+  # GitHub can delay or drop scheduled runs, especially at the top of the hour, so this runs
+  # at odd minutes, with two backups. Extra runs are harmless: each run replaces rows rather
+  # than adding them, runs never overlap (see concurrency), and later runs refresh the
+  # report's injury check.
   schedule:
-    - cron: "0 10 * * *"        # 10:00 UTC every day (5-6am Eastern), after late games are final
+    - cron: "23 10 * * *"       # 10:23 UTC (5:23-6:23am Eastern), after late games are final
+    - cron: "47 11 * * *"       # backup
+    - cron: "17 13 * * *"       # backup (8:17-9:17am Eastern)
   workflow_dispatch:            # adds a "Run workflow" button on the Actions tab
     inputs:
       full_rebuild:
